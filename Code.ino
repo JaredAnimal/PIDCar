@@ -11,8 +11,9 @@ const uint8_t STATUS_LED = 41;
 
 // First parameters to tune. PWM uses 0..255, not percent.
 const int BASE_PWM = 45;
-const float KP = 5.0f;
+const float KP = 10.0f;  // CHANGED from 5.0: stronger turning on curves (try 8-12)
 const float KD = 25.0f;  // Error difference per nominal 6 ms, NOT per second.
+                         // Raise to 35-50 if the car wobbles after raising KP.
 const float CENTER_OFFSET = 0.48509f; // From the supplied centered sample.
 const float STEERING_SIGN = 1.0f;    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
@@ -174,7 +175,9 @@ void loop() {
     clearReads = 0;
     derivativeReady = false;
     filteredDelta = 0.0f;
-    drive(limitFloat(lastTurn, -15.0f, 15.0f));
+    // CHANGED: was limitFloat(lastTurn, -15, 15), which weakened the turn
+    // exactly when the car slid off a curve. Keep the full last turn instead.
+    drive(lastTurn);
     return;
   }
 
