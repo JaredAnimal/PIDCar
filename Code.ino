@@ -12,10 +12,14 @@ const uint8_t STATUS_LED = 41;
 // First parameters to tune. PWM uses 0..255, not percent.
 const int BASE_PWM = 45;
 const float KP = 10.0f;  // CHANGED from 5.0: stronger turning on curves (try 8-12)
-const float KD = 25.0f;  // Error difference per nominal 6 ms, NOT per second.
+const float KD = 35.0f;  // Error difference per nominal 6 ms, NOT per second.
                          // Raise to 35-50 if the car wobbles after raising KP.
 const float CENTER_OFFSET = 0.48509f; // From the supplied centered sample.
-const float STEERING_SIGN = 1.0f;    // Change only if verified steering is reversed.
+const float STEERING_SIGN = 1.0f;
+// ADDED for sharp turns:
+const float MAX_TURN = 70.0f;     // Turn limit. Above BASE_PWM lets the inner wheel spin BACKWARD (pivot).
+const float CURVE_SLOW = 3.0f;    // PWM removed from base speed per unit of |error| (slow down in curves).
+const float MIN_BASE_PWM = 25.0f; // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
 const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course needs it.
@@ -48,17 +52,26 @@ float limitFloat(float value, float low, float high) {
 void stopMotors() {
   analogWrite(LEFT_PWM, 0);
   analogWrite(RIGHT_PWM, 0);
+  digitalWrite(LEFT_DIR, LOW);   // back to forward
+  digitalWrite(RIGHT_DIR, LOW);
   digitalWrite(LEFT_SLEEP, LOW);
   digitalWrite(RIGHT_SLEEP, LOW);
 }
 
-void drive(float turn) {
+// CHANGED: one wheel command; negative = run that wheel backward.
+void setWheel(uint8_t dirPin, uint8_t pwmPin, float cmd) {
+  digitalWrite(dirPin, cmd < 0 ? HIGH : LOW);   // LOW = forward on stock RSLK
+  int pwm = (int)(cmd < 0 ? -cmd : cmd);
+  if (pwm > 255) pwm = 255;
+  analogWrite(pwmPin, pwm);
+}
+
+// CHANGED: takes a base speed, and allows the inner wheel to reverse on sharp turns.
+void drive(float turn, float base) {
   // Positive error = line to the left: slow the left wheel, speed up the right.
-  // Limit the correction before mixing so both commands remain in range.
-  const float maxTurn = BASE_PWM < (255 - BASE_PWM) ? BASE_PWM : (255 - BASE_PWM);
-  turn = limitFloat(turn, -maxTurn, maxTurn);
-  analogWrite(LEFT_PWM, (int)(BASE_PWM - turn));
-  analogWrite(RIGHT_PWM, (int)(BASE_PWM + turn));
+  turn = limitFloat(turn, -MAX_TURN, MAX_TURN);
+  setWheel(LEFT_DIR, LEFT_PWM, base - turn);
+  setWheel(RIGHT_DIR, RIGHT_PWM, base + turn);
   digitalWrite(LEFT_SLEEP, HIGH);
   digitalWrite(RIGHT_SLEEP, HIGH);
 }
@@ -166,7 +179,7 @@ void loop() {
       }
     }
     lastSeenMs = nowMs;
-    drive(lastTurn);
+    drive(lastTurn, BASE_PWM);
     return;
   }
   barReads = 0; // Confirmation must be consecutive.
@@ -176,8 +189,9 @@ void loop() {
     derivativeReady = false;
     filteredDelta = 0.0f;
     // CHANGED: was limitFloat(lastTurn, -15, 15), which weakened the turn
-    // exactly when the car slid off a curve. Keep the full last turn instead.
-    drive(lastTurn);
+    // exactly when the car slid off a curve. Now: pivot hard toward the side
+    // the line was last seen, at low speed, until the line comes back.
+    drive(lastTurn >= 0 ? MAX_TURN : -MAX_TURN, MIN_BASE_PWM);
     return;
   }
 
@@ -193,6 +207,10 @@ void loop() {
   previousError = error;
   derivativeReady = true;
   lastTurn = STEERING_SIGN * (KP * error + KD * filteredDelta);
-  lastTurn = limitFloat(lastTurn, -float(BASE_PWM), float(BASE_PWM));
-  drive(lastTurn);
+  lastTurn = limitFloat(lastTurn, -MAX_TURN, MAX_TURN);   // CHANGED: was +/-BASE_PWM
+
+  // ADDED: slow down the bigger the error, so the car can make tight curves.
+  float base = BASE_PWM - CURVE_SLOW * fabs(error);
+  if (base < MIN_BASE_PWM) base = MIN_BASE_PWM;
+  drive(lastTurn, base);
 }
