@@ -26,8 +26,9 @@ const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course ne
 const int MIN_LINE_PEAK = 220;       // Normalized 0..1000. Initial guess.
 const int MIN_LINE_SUM = 300;
 const int BAR_DARK_LEVEL = 700;
-const uint8_t BAR_SENSOR_COUNT = 6;
-const uint8_t BAR_CONFIRM_READS = 2;
+const uint8_t BAR_SENSOR_COUNT = 7;   // CHANGED from 6: curves were triggering it
+const uint8_t BAR_CONFIRM_READS = 3;  // CHANGED from 2: bar must be seen 3 reads in a row
+const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
 const uint8_t CLEAR_READS_TO_ARM = 10;
 
 // S1..S8 in the spreadsheet = raw indices 0..7 in the calibration sketch.
@@ -153,6 +154,7 @@ void loop() {
 
   int sum = 0, peak = 0, weighted = 0;
   uint8_t darkSensors = 0;
+  bool edgeDark[8] = {false};
   for (uint8_t i = 0; i < 8; ++i) {
     // Signed, wide arithmetic prevents underflow and early integer truncation.
     int value = (int32_t(raw[i]) - SENSOR_MIN[i]) * 1000L /
@@ -162,17 +164,19 @@ void loop() {
     sum += value;
     weighted += POSITION[i] * value;
     if (value > peak) peak = value;
-    if (value >= BAR_DARK_LEVEL) ++darkSensors;
+    if (value >= BAR_DARK_LEVEL) { ++darkSensors; edgeDark[i] = true; }
   }
 
   const bool lineSeen = peak >= MIN_LINE_PEAK && sum >= MIN_LINE_SUM;
-  const bool crosspiece = darkSensors >= BAR_SENSOR_COUNT;
+  // CHANGED: a real crossbar covers BOTH outermost sensors at once.
+  // A sharp curve comes in from one side, so it fails this check.
+  const bool crosspiece = darkSensors >= BAR_SENSOR_COUNT && edgeDark[0] && edgeDark[7];
   if (crosspiece) {
     clearReads = 0;
     derivativeReady = false;
     filteredDelta = 0.0f;
     // A lone all-dark glitch must not produce a steering spike or a finish.
-    if (finishArmed) {
+    if (finishArmed && STOP_AT_BAR) {
       if (++barReads >= BAR_CONFIRM_READS) {
         stopRun(true);
         return;
