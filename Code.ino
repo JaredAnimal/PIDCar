@@ -29,6 +29,12 @@ const int BAR_DARK_LEVEL = 700;
 const uint8_t BAR_SENSOR_COUNT = 7;   // CHANGED from 6: curves were triggering it
 const uint8_t BAR_CONFIRM_READS = 3;  // CHANGED from 2: bar must be seen 3 reads in a row
 const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
+
+// ADDED: 180-degree turnaround at the FIRST bar, stop at the SECOND bar.
+const int TURN_PWM = 60;              // Spin speed for the turnaround.
+const long TURN_COUNTS = 360;         // Encoder counts per wheel for 180 deg. INITIAL GUESS: tune on the floor.
+const uint32_t TURN_TIMEOUT_MS = 2000;// Backstop if the encoders don't count.
+const long REARM_COUNTS = 300;        // Distance to drive after turning before the next bar can count.
 const uint8_t CLEAR_READS_TO_ARM = 10;
 
 // S1..S8 in the spreadsheet = raw indices 0..7 in the calibration sketch.
@@ -37,7 +43,7 @@ const int SENSOR_MIN[8] = {772, 657, 612, 612, 567, 612, 635, 797};
 const int SENSOR_MAX[8] = {2500, 2469, 2500, 1934, 2027, 1911, 2500, 2500};
 const int POSITION[8] = {-7, -5, -3, -1, 1, 3, 5, 7};
 
-enum RunState { WAITING, START_DELAY, TRACKING, FINISHED, FAULT };
+enum RunState { WAITING, START_DELAY, TRACKING, TURNING, FINISHED, FAULT };
 RunState state = WAITING;
 uint16_t raw[8];
 uint32_t buttonChangedMs = 0, startMs = 0, lastSeenMs = 0, lastSampleUs = 0;
@@ -45,6 +51,8 @@ bool lastButtonDown = false, startPressSeen = false;
 bool finishArmed = false, derivativeReady = false;
 uint8_t clearReads = 0, barReads = 0;
 float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
+uint8_t barsSeen = 0;                 // ADDED: 0 = going out, 1 = coming back
+uint32_t turnStartMs = 0;
 
 float limitFloat(float value, float low, float high) {
   return value < low ? low : (value > high ? high : value);
@@ -75,6 +83,29 @@ void drive(float turn, float base) {
   setWheel(RIGHT_DIR, RIGHT_PWM, base + turn);
   digitalWrite(LEFT_SLEEP, HIGH);
   digitalWrite(RIGHT_SLEEP, HIGH);
+}
+
+// ADDED: encoder helpers (ECE3 library)
+long encoderAverage() {
+  long l = getEncoderCount_left(), r = getEncoderCount_right();
+  if (l < 0) l = -l;
+  if (r < 0) r = -r;
+  return (l + r) / 2;
+}
+void resetEncoders() {
+  resetEncoderCount_left();
+  resetEncoderCount_right();
+}
+
+// ADDED: start spinning in place (left wheel back, right wheel forward).
+void startTurn(uint32_t nowMs) {
+  resetEncoders();
+  setWheel(LEFT_DIR, LEFT_PWM, -TURN_PWM);
+  setWheel(RIGHT_DIR, RIGHT_PWM, TURN_PWM);
+  digitalWrite(LEFT_SLEEP, HIGH);
+  digitalWrite(RIGHT_SLEEP, HIGH);
+  turnStartMs = nowMs;
+  state = TURNING;
 }
 
 void stopRun(bool success) {
@@ -142,6 +173,27 @@ void loop() {
     return;
   }
 
+  // ADDED: turnaround in progress. Non-blocking: check encoders each loop.
+  if (state == TURNING) {
+    digitalWrite(STATUS_LED, (nowMs / 100) % 2);
+    if (encoderAverage() >= TURN_COUNTS || nowMs - turnStartMs >= TURN_TIMEOUT_MS) {
+      analogWrite(LEFT_PWM, 0);
+      analogWrite(RIGHT_PWM, 0);
+      digitalWrite(LEFT_DIR, LOW);     // both forward again
+      digitalWrite(RIGHT_DIR, LOW);
+      delay(100);                      // brief settle so the car doesn't lurch
+      resetEncoders();                 // measure distance driven since the turn
+      finishArmed = false;
+      clearReads = barReads = 0;
+      derivativeReady = false;
+      filteredDelta = 0.0f;
+      lastTurn = 0.0f;
+      lastSampleUs = micros();
+      state = TRACKING;
+    }
+    return;
+  }
+
   const uint32_t nowUs = micros();
   const uint32_t elapsedUs = nowUs - lastSampleUs;
   if (elapsedUs < SAMPLE_US) return;  // No delay() and no catch-up bursts.
@@ -178,7 +230,13 @@ void loop() {
     // A lone all-dark glitch must not produce a steering spike or a finish.
     if (finishArmed && STOP_AT_BAR) {
       if (++barReads >= BAR_CONFIRM_READS) {
-        stopRun(true);
+        // CHANGED: first bar = turn around, second bar = stop.
+        if (barsSeen == 0) {
+          barsSeen = 1;
+          startTurn(nowMs);
+        } else {
+          stopRun(true);
+        }
         return;
       }
     }
@@ -201,7 +259,10 @@ void loop() {
 
   lastSeenMs = nowMs;
   // Ignore a starting bar. Arm the finish only after ten valid narrow readings.
-  if (!finishArmed && ++clearReads >= CLEAR_READS_TO_ARM) finishArmed = true;
+  // CHANGED: after the turnaround, also require REARM_COUNTS of driving,
+  // so the car can't re-trigger on the bar it just turned on.
+  if (!finishArmed && ++clearReads >= CLEAR_READS_TO_ARM &&
+      (barsSeen == 0 || encoderAverage() >= REARM_COUNTS)) finishArmed = true;
   const float error = float(weighted) / float(sum) - CENTER_OFFSET;
   float delta = 0.0f;
   if (derivativeReady) {
