@@ -1,4 +1,4 @@
-// ECE3 line follower: turn at the first confirmed bar and stop at the second.
+// ECE3 line follower (PID): turn at the first confirmed bar and stop at the second.
 // Starts automatically after a one-second countdown. Reset for another run.
 // Gains and thresholds need track testing.
 #include <Arduino.h>
@@ -14,6 +14,11 @@ const uint8_t STATUS_LED = 41;
 const float BASE_PWM = 45.0f;
 const float STEERING_ERROR_PERCENT = 50.0f; // Starting P correction at maximum error.
 const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..10.
+// ADDED (PID): integral term. It builds up while the car stays on one side of
+// the line (a long or sharp curve), adding extra turn the longer the curve lasts.
+const float KI_TO_KP_RATIO = 3.0f;          // KI = 3 x KP, per second. Try 1..6.
+const float INTEGRAL_MAX_TURN = 25.0f;      // Most PWM the I term can ever add.
+const float INTEGRAL_DEADBAND = 300.0f;     // Ignore small errors (0..2000 scale) so straights don't wind up.
 const float CENTER_OFFSET = 0.48509f; // From the supplied centered sample.
 const float STEERING_SIGN = 1.0f;
 // ADDED for sharp turns:
@@ -52,6 +57,8 @@ const float MAX_CENTROID_ERROR =
 const float PD_ERROR_SCALE = 2000.0f / MAX_CENTROID_ERROR;
 const float KP = (STEERING_ERROR_PERCENT / 100.0f) * BASE_PWM / 2000.0f;
 const float KD = KD_TO_KP_RATIO * KP; // Error change per nominal 6 ms.
+const float KI = KI_TO_KP_RATIO * KP; // ADDED (PID): per second of accumulated error.
+const float INTEGRAL_LIMIT = INTEGRAL_MAX_TURN / KI; // Anti-windup clamp.
 
 enum RunState { WAITING, START_DELAY, TRACKING, TURNING, FINISHED, FAULT };
 RunState state = WAITING;
@@ -63,6 +70,7 @@ uint8_t clearReads = 0, barReads = 0;
 float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
 uint8_t barsSeen = 0;                 // ADDED: 0 = going out, 1 = coming back
 uint32_t turnStartMs = 0;
+float integral = 0.0f;                // ADDED (PID): accumulated error x seconds
 
 float limitFloat(float value, float low, float high) {
   return value < low ? low : (value > high ? high : value);
@@ -197,6 +205,7 @@ void loop() {
       clearReads = barReads = 0;
       derivativeReady = false;
       filteredDelta = 0.0f;
+      integral = 0.0f;                 // ADDED (PID)
       lastTurn = 0.0f;
       lastSampleUs = micros();
       state = TRACKING;
@@ -235,6 +244,7 @@ void loop() {
     clearReads = 0;
     derivativeReady = false;
     filteredDelta = 0.0f;
+    integral = 0.0f;                   // ADDED (PID)
     // A lone all-dark glitch must not produce a steering spike or a finish.
     if (finishArmed && STOP_AT_BAR) {
       if (++barReads >= BAR_CONFIRM_READS) {
@@ -281,7 +291,24 @@ void loop() {
   derivativeReady = true;
   const float pdError = error * PD_ERROR_SCALE;
   const float pdDelta = filteredDelta * PD_ERROR_SCALE;
-  lastTurn = STEERING_SIGN * (KP * pdError + KD * pdDelta);
+
+  // ADDED (PID): integral term with three safety rules.
+  // 1. Only accumulate when clearly off-center (in a curve, not on a straight).
+  // 2. Reset to zero the moment the error changes side, so it never fights
+  //    the car on the way out of a curve (no overshoot).
+  // 3. Clamp it, and stop adding while steering is already maxed (anti-windup).
+  const float dt = float(elapsedUs) * 1e-6f;
+  if ((pdError > 0.0f && integral < 0.0f) || (pdError < 0.0f && integral > 0.0f)) {
+    integral = 0.0f;
+  }
+  const bool saturated = fabsf(lastTurn) >= MAX_TURN &&
+                         ((lastTurn > 0.0f) == (STEERING_SIGN * pdError > 0.0f));
+  if (fabsf(pdError) > INTEGRAL_DEADBAND && !saturated) {
+    integral += pdError * dt;
+  }
+  integral = limitFloat(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+
+  lastTurn = STEERING_SIGN * (KP * pdError + KI * integral + KD * pdDelta);
   lastTurn = limitFloat(lastTurn, -MAX_TURN, MAX_TURN);   // CHANGED: was +/-BASE_PWM
 
   // ADDED: slow down the bigger the error, so the car can make tight curves.
