@@ -1,8 +1,9 @@
-// ECE3 slow starting point: follow one black line and stop at the end bar.
-// S1: press and release to start. S2: stop. Reset the board for another run.
-// See README.md before the first run. Gains and thresholds need track testing.
+// ECE3 line follower: turn at the first confirmed bar and stop at the second.
+// Starts automatically after a one-second countdown. Reset for another run.
+// Gains and thresholds need track testing.
 #include <Arduino.h>
 #include <ECE3.h>
+#include <math.h>
 
 const uint8_t LEFT_SLEEP = 31, LEFT_DIR = 29, LEFT_PWM = 40;
 const uint8_t RIGHT_SLEEP = 11, RIGHT_DIR = 30, RIGHT_PWM = 39;
@@ -10,10 +11,9 @@ const uint8_t START_BUTTON = 73, STOP_BUTTON = 74;
 const uint8_t STATUS_LED = 41;
 
 // First parameters to tune. PWM uses 0..255, not percent.
-const int BASE_PWM = 45;
-const float KP = 10.0f;  // CHANGED from 5.0: stronger turning on curves (try 8-12)
-const float KD = 35.0f;  // Error difference per nominal 6 ms, NOT per second.
-                         // Raise to 35-50 if the car wobbles after raising KP.
+const float BASE_PWM = 45.0f;
+const float STEERING_ERROR_PERCENT = 50.0f; // Starting P correction at maximum error.
+const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..10.
 const float CENTER_OFFSET = 0.48509f; // From the supplied centered sample.
 const float STEERING_SIGN = 1.0f;
 // ADDED for sharp turns:
@@ -26,8 +26,8 @@ const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course ne
 const int MIN_LINE_PEAK = 220;       // Normalized 0..1000. Initial guess.
 const int MIN_LINE_SUM = 300;
 const int BAR_DARK_LEVEL = 700;
-const uint8_t BAR_SENSOR_COUNT = 7;   // CHANGED from 6: curves were triggering it
-const uint8_t BAR_CONFIRM_READS = 3;  // CHANGED from 2: bar must be seen 3 reads in a row
+const uint8_t BAR_SENSOR_COUNT = 8;   // All eight sensors must see black.
+const uint8_t BAR_CONFIRM_READS = 2;  // Reject a one-sample all-black glitch.
 const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
 
 // ADDED: 180-degree turnaround at the FIRST bar, stop at the SECOND bar.
@@ -42,6 +42,16 @@ const uint8_t CLEAR_READS_TO_ARM = 10;
 const int SENSOR_MIN[8] = {772, 657, 612, 612, 567, 612, 635, 797};
 const int SENSOR_MAX[8] = {2500, 2469, 2500, 1934, 2027, 1911, 2500, 2500};
 const int POSITION[8] = {-7, -5, -3, -1, 1, 3, 5, 7};
+
+// Scale PD to a maximum absolute error of 2000 for the professor's gain rule.
+// POSITION is ordered, so its endpoints bound every possible centroid.
+// Curve slowing and recovery continue to use the original centroid units.
+const float MAX_CENTROID_ERROR =
+    fmaxf(fabsf(float(POSITION[0]) - CENTER_OFFSET),
+          fabsf(float(POSITION[7]) - CENTER_OFFSET));
+const float PD_ERROR_SCALE = 2000.0f / MAX_CENTROID_ERROR;
+const float KP = (STEERING_ERROR_PERCENT / 100.0f) * BASE_PWM / 2000.0f;
+const float KD = KD_TO_KP_RATIO * KP; // Error change per nominal 6 ms.
 
 enum RunState { WAITING, START_DELAY, TRACKING, TURNING, FINISHED, FAULT };
 RunState state = WAITING;
@@ -69,8 +79,8 @@ void stopMotors() {
 
 // CHANGED: one wheel command; negative = run that wheel backward.
 void setWheel(uint8_t dirPin, uint8_t pwmPin, float cmd) {
-  digitalWrite(dirPin, cmd < 0 ? HIGH : LOW);   // LOW = forward on stock RSLK
-  int pwm = (int)(cmd < 0 ? -cmd : cmd);
+  digitalWrite(dirPin, cmd < 0.0f ? HIGH : LOW); // LOW = forward on stock RSLK
+  int pwm = (int)fabsf(cmd);
   if (pwm > 255) pwm = 255;
   analogWrite(pwmPin, pwm);
 }
@@ -206,7 +216,6 @@ void loop() {
 
   int sum = 0, peak = 0, weighted = 0;
   uint8_t darkSensors = 0;
-  bool edgeDark[8] = {false};
   for (uint8_t i = 0; i < 8; ++i) {
     // Signed, wide arithmetic prevents underflow and early integer truncation.
     int value = (int32_t(raw[i]) - SENSOR_MIN[i]) * 1000L /
@@ -216,13 +225,12 @@ void loop() {
     sum += value;
     weighted += POSITION[i] * value;
     if (value > peak) peak = value;
-    if (value >= BAR_DARK_LEVEL) { ++darkSensors; edgeDark[i] = true; }
+    if (value >= BAR_DARK_LEVEL) ++darkSensors;
   }
 
   const bool lineSeen = peak >= MIN_LINE_PEAK && sum >= MIN_LINE_SUM;
-  // CHANGED: a real crossbar covers BOTH outermost sensors at once.
-  // A sharp curve comes in from one side, so it fails this check.
-  const bool crosspiece = darkSensors >= BAR_SENSOR_COUNT && edgeDark[0] && edgeDark[7];
+  // Require all eight normalized sensors to see black at once.
+  const bool crosspiece = darkSensors >= BAR_SENSOR_COUNT;
   if (crosspiece) {
     clearReads = 0;
     derivativeReady = false;
@@ -253,7 +261,7 @@ void loop() {
     // CHANGED: was limitFloat(lastTurn, -15, 15), which weakened the turn
     // exactly when the car slid off a curve. Now: pivot hard toward the side
     // the line was last seen, at low speed, until the line comes back.
-    drive(lastTurn >= 0 ? MAX_TURN : -MAX_TURN, MIN_BASE_PWM);
+    drive(lastTurn >= 0.0f ? MAX_TURN : -MAX_TURN, MIN_BASE_PWM);
     return;
   }
 
@@ -271,11 +279,13 @@ void loop() {
   filteredDelta += 0.35f * (delta - filteredDelta);
   previousError = error;
   derivativeReady = true;
-  lastTurn = STEERING_SIGN * (KP * error + KD * filteredDelta);
+  const float pdError = error * PD_ERROR_SCALE;
+  const float pdDelta = filteredDelta * PD_ERROR_SCALE;
+  lastTurn = STEERING_SIGN * (KP * pdError + KD * pdDelta);
   lastTurn = limitFloat(lastTurn, -MAX_TURN, MAX_TURN);   // CHANGED: was +/-BASE_PWM
 
   // ADDED: slow down the bigger the error, so the car can make tight curves.
-  float base = BASE_PWM - CURVE_SLOW * fabs(error);
+  float base = BASE_PWM - CURVE_SLOW * fabsf(error);
   if (base < MIN_BASE_PWM) base = MIN_BASE_PWM;
   drive(lastTurn, base);
 }
