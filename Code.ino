@@ -40,7 +40,17 @@ const float SHARP_ENTER_ERROR = 3.0f;  // CHANGED from 4: start the pivot earlie
 const float SHARP_EXIT_ERROR = 1.5f;   // |error| to go back to normal PID
 const float SHARP_TURN = 90.0f;        // Pivot strength (PWM each way)
 const float SHARP_BASE_PWM = 20.0f;    // Forward part during the pivot -> wheels -70 / +110
-const float TURN_LIMIT = 150.0f;       // CHANGED from 120: must be >= MAX_TURN
+const float TURN_LIMIT = 150.0f;
+// ADDED: STRAIGHT-LINE BOOST. On straights (small error) speed ramps up
+// quickly; the moment the error grows (a curve is coming) the boost is cut
+// to zero and the car briefly brakes before the curve.
+const float STRAIGHT_ERROR = 0.8f;    // |error| below this = straight: ramp up
+const float BOOST_DROP_ERROR = 1.5f;  // |error| above this = curve: cut boost to 0 at once
+const float BOOST_MAX = 60.0f;        // Extra PWM on long straights (90 + 60 = 150)
+const float BOOST_RAMP_UP = 150.0f;   // PWM gained per second (0 -> 60 in 0.4 s)
+const float BOOST_DECAY = 300.0f;     // PWM lost per second between the two thresholds
+const float BRAKE_MIN_BOOST = 20.0f;  // Only brake if boost was at least this high
+const uint32_t BRAKE_MS = 60;         // Brake time: forward speed 0, steering still active       // CHANGED from 120: must be >= MAX_TURN
 const float SIDE_MEMORY_ERROR = 1.0f;  // ADDED: |error| needed to remember which side the line is on // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
@@ -88,6 +98,8 @@ float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
 uint8_t barsSeen = 0;                 // ADDED: 0 = going out, 1 = coming back
 uint32_t turnStartMs = 0;
 float integral = 0.0f;
+float boost = 0.0f;                   // ADDED: current straight-line boost
+uint32_t brakeUntilMs = 0;            // ADDED: braking until this time
 bool sharpMode = false;               // ADDED: true while pivoting through a sharp corner
 int lastSide = 0;                     // ADDED: +1 / -1 = side the line was last clearly seen on
 
@@ -227,6 +239,7 @@ void loop() {
       integral = 0.0f;                 // ADDED (PID)
       lastSide = 0;
       sharpMode = false;
+      boost = 0.0f;
       lastTurn = 0.0f;
       lastSampleUs = micros();
       state = TRACKING;
@@ -280,12 +293,14 @@ void loop() {
       }
     }
     lastSeenMs = nowMs;
+    boost = 0.0f;                      // ADDED: no boost over a bar
     drive(lastTurn, BASE_PWM);
     return;
   }
   barReads = 0; // Confirmation must be consecutive.
 
   if (!lineSeen) {
+    boost = 0.0f;                      // ADDED: lost line = no boost
     clearReads = 0;
     derivativeReady = false;
     filteredDelta = 0.0f;
@@ -325,6 +340,7 @@ void loop() {
     filteredDelta = 0.0f;
   }
   if (sharpMode) {
+    boost = 0.0f;                      // ADDED: no boost while pivoting
     const float side = error > 0.0f ? 1.0f : -1.0f;
     lastTurn = STEERING_SIGN * side * MAX_TURN;   // recovery & bar logic stay consistent
     previousError = error;
@@ -364,5 +380,22 @@ void loop() {
   // ADDED: slow down the bigger the error, so the car can make tight curves.
   float base = BASE_PWM - CURVE_SLOW * fabsf(error);
   if (base < MIN_BASE_PWM) base = MIN_BASE_PWM;
-  drive(lastTurn, base);
+
+  // ADDED: straight-line boost with fast cut and brake before curves.
+  const float absError = fabsf(error);
+  if (absError < STRAIGHT_ERROR) {
+    boost += BOOST_RAMP_UP * dt;                    // straight: speed up
+  } else if (absError > BOOST_DROP_ERROR) {
+    if (boost >= BRAKE_MIN_BOOST) brakeUntilMs = nowMs + BRAKE_MS;  // was fast: brake
+    boost = 0.0f;                                   // curve coming: cut at once
+  } else {
+    boost -= BOOST_DECAY * dt;                      // in between: ease off fast
+  }
+  boost = limitFloat(boost, 0.0f, BOOST_MAX);
+
+  if (nowMs < brakeUntilMs) {
+    drive(lastTurn, 0.0f);    // brake: no forward drive, keep steering into the curve
+  } else {
+    drive(lastTurn, base + boost);
+  }
 }
