@@ -19,19 +19,29 @@ const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..
 const float KI_TO_KP_RATIO = 3.0f;          // KI = 3 x KP, per second. Try 1..6.
 const float INTEGRAL_MAX_TURN = 25.0f;      // Most PWM the I term can ever add.
 const float INTEGRAL_DEADBAND = 80.0f;      // CHANGED from 300: now also removes a steady offset on straights.
-const float CENTER_OFFSET = -0.815f; // CHANGED from 0.485: center check read -1.3, so 0.485 + (-1.3)
+const float CENTER_OFFSET = 0.48509f; // From the calibration spreadsheet (ERROR = 0 row).
 const float STEERING_SIGN = 1.0f;
 // ADDED: motor trim. If the car drifts to one side on a straight, lower the
 // stronger side slightly (e.g. 0.95). 1.0 = no change.
 const float LEFT_TRIM = 1.0f;
 const float RIGHT_TRIM = 1.0f;
-// ADDED: centering check. true = motors OFF, prints error over Serial (9600).
-// Put the car exactly centered on the line: error should read about 0.
-const bool CENTER_CHECK = false;
 // ADDED for sharp turns:
 const float MAX_TURN = 70.0f;     // Turn limit. Above BASE_PWM lets the inner wheel spin BACKWARD (pivot).
-const float CURVE_SLOW = 5.0f;    // PWM removed from base speed per unit of |error| (slow down in curves).
-const float MIN_BASE_PWM = 25.0f; // Never slow below this in a curve.    // Change only if verified steering is reversed.
+const float CURVE_SLOW = 2.0f;    // CHANGED: only mild slowing in curves (see SHARP mode)
+const float MIN_BASE_PWM = 35.0f; // CHANGED from 25: low PWM = low torque, sluggish turning
+const float RECOVERY_BASE_PWM = 0.0f;  // CHANGED from 10: pure pivot when the line is lost
+
+// ADDED: SHARP-CORNER MODE (for the 135-degree turn).
+// When the line reaches the outer sensors, stop using gentle PD steering and
+// pivot HARD: inner wheel fast backward, outer wheel fast forward. The car
+// rotates quickly but barely moves forward, so it stays on the corner.
+// Hysteresis: enter at a large error, stay in until nearly re-centered.
+const float SHARP_ENTER_ERROR = 4.0f;  // |error| (sensor units, max ~7) to start the pivot
+const float SHARP_EXIT_ERROR = 1.5f;   // |error| to go back to normal PID
+const float SHARP_TURN = 90.0f;        // Pivot strength (PWM each way)
+const float SHARP_BASE_PWM = 20.0f;    // Forward part during the pivot -> wheels -70 / +110
+const float TURN_LIMIT = 120.0f;       // Absolute limit inside drive()
+const float SIDE_MEMORY_ERROR = 1.0f;  // ADDED: |error| needed to remember which side the line is on // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
 const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course needs it.
@@ -77,7 +87,9 @@ uint8_t clearReads = 0, barReads = 0;
 float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
 uint8_t barsSeen = 0;                 // ADDED: 0 = going out, 1 = coming back
 uint32_t turnStartMs = 0;
-float integral = 0.0f;                // ADDED (PID): accumulated error x seconds
+float integral = 0.0f;
+bool sharpMode = false;               // ADDED: true while pivoting through a sharp corner
+int lastSide = 0;                     // ADDED: +1 / -1 = side the line was last clearly seen on
 
 float limitFloat(float value, float low, float high) {
   return value < low ? low : (value > high ? high : value);
@@ -103,7 +115,7 @@ void setWheel(uint8_t dirPin, uint8_t pwmPin, float cmd) {
 // CHANGED: takes a base speed, and allows the inner wheel to reverse on sharp turns.
 void drive(float turn, float base) {
   // Positive error = line to the left: slow the left wheel, speed up the right.
-  turn = limitFloat(turn, -MAX_TURN, MAX_TURN);
+  turn = limitFloat(turn, -TURN_LIMIT, TURN_LIMIT);   // CHANGED: PID still limited to MAX_TURN below
   setWheel(LEFT_DIR, LEFT_PWM, (base - turn) * LEFT_TRIM);    // CHANGED: trim
   setWheel(RIGHT_DIR, RIGHT_PWM, (base + turn) * RIGHT_TRIM);
   digitalWrite(LEFT_SLEEP, HIGH);
@@ -157,7 +169,6 @@ void setup() {
   digitalWrite(STATUS_LED, LOW);
   ECE3_Init();
   stopMotors();
-  Serial.begin(9600);    // ADDED: for CENTER_CHECK
   state = START_DELAY;   // skip the button wait
   startMs = millis();    // start the delay timer
 }
@@ -214,6 +225,8 @@ void loop() {
       derivativeReady = false;
       filteredDelta = 0.0f;
       integral = 0.0f;                 // ADDED (PID)
+      lastSide = 0;
+      sharpMode = false;
       lastTurn = 0.0f;
       lastSampleUs = micros();
       state = TRACKING;
@@ -279,7 +292,15 @@ void loop() {
     // CHANGED: was limitFloat(lastTurn, -15, 15), which weakened the turn
     // exactly when the car slid off a curve. Now: pivot hard toward the side
     // the line was last seen, at low speed, until the line comes back.
-    drive(lastTurn >= 0.0f ? MAX_TURN : -MAX_TURN, MIN_BASE_PWM);
+    // CHANGED: turn toward the side the line was last CLEARLY seen on.
+    // (lastTurn could flip sign from D-term noise right before the line was
+    // lost, sending the car the wrong way. That made curves fail randomly.)
+    // Near-pivot (low base) so the car turns back instead of driving off.
+    if (lastSide != 0) {
+      drive(STEERING_SIGN * lastSide * SHARP_TURN, RECOVERY_BASE_PWM);
+    } else {
+      drive(lastTurn >= 0.0f ? SHARP_TURN : -SHARP_TURN, RECOVERY_BASE_PWM);
+    }
     return;
   }
 
@@ -290,18 +311,27 @@ void loop() {
   if (!finishArmed && ++clearReads >= CLEAR_READS_TO_ARM &&
       (barsSeen == 0 || encoderAverage() >= REARM_COUNTS)) finishArmed = true;
   const float error = float(weighted) / float(sum) - CENTER_OFFSET;
+  // ADDED: remember the side only when clearly off-center, so noise near
+  // the middle can't change it.
+  if (error > SIDE_MEMORY_ERROR) lastSide = 1;
+  else if (error < -SIDE_MEMORY_ERROR) lastSide = -1;
 
-  // ADDED: centering check mode. No driving; print the error 5x per second.
-  if (CENTER_CHECK) {
-    stopMotors();
-    static uint32_t lastPrintMs = 0;
-    if (nowMs - lastPrintMs >= 200) {
-      lastPrintMs = nowMs;
-      Serial.print("error = ");
-      Serial.println(error, 3);
-    }
+  // ADDED: sharp-corner mode with hysteresis.
+  if (!sharpMode && fabsf(error) >= SHARP_ENTER_ERROR) sharpMode = true;
+  if (sharpMode && fabsf(error) <= SHARP_EXIT_ERROR) {
+    sharpMode = false;
+    integral = 0.0f;            // start normal PID fresh out of the corner
+    derivativeReady = false;
+    filteredDelta = 0.0f;
+  }
+  if (sharpMode) {
+    const float side = error > 0.0f ? 1.0f : -1.0f;
+    lastTurn = STEERING_SIGN * side * MAX_TURN;   // recovery & bar logic stay consistent
+    previousError = error;
+    drive(STEERING_SIGN * side * SHARP_TURN, SHARP_BASE_PWM);
     return;
   }
+
   float delta = 0.0f;
   if (derivativeReady) {
     delta = (error - previousError) * (float(SAMPLE_US) / float(elapsedUs));
