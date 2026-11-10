@@ -30,7 +30,7 @@ const float RIGHT_TRIM = 1.0f;
 const bool CENTER_CHECK = false;
 // ADDED for sharp turns:
 const float MAX_TURN = 70.0f;     // Turn limit. Above BASE_PWM lets the inner wheel spin BACKWARD (pivot).
-const float CURVE_SLOW = 3.0f;    // PWM removed from base speed per unit of |error| (slow down in curves).
+const float CURVE_SLOW = 5.0f;    // PWM removed from base speed per unit of |error| (slow down in curves).
 const float MIN_BASE_PWM = 25.0f; // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
