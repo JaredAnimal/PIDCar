@@ -36,11 +36,16 @@ const float RECOVERY_BASE_PWM = 0.0f;  // CHANGED from 10: pure pivot when the l
 // pivot HARD: inner wheel fast backward, outer wheel fast forward. The car
 // rotates quickly but barely moves forward, so it stays on the corner.
 // Hysteresis: enter at a large error, stay in until nearly re-centered.
-const float SHARP_ENTER_ERROR = 3.0f;  // CHANGED from 4: start the pivot earlier at high speed
-const float SHARP_EXIT_ERROR = 1.5f;   // |error| to go back to normal PID
-const float SHARP_TURN = 90.0f;        // Pivot strength (PWM each way)
-const float SHARP_BASE_PWM = 20.0f;    // Forward part during the pivot -> wheels -70 / +110
+const float SHARP_ENTER_ERROR = 5.5f;  // CHANGED from 3: pivot is now only a SAFETY NET for extreme errors
+const float SHARP_EXIT_ERROR = 3.0f;   // CHANGED from 1.5: hand back to smooth steering sooner
+const float SHARP_TURN = 80.0f;        // CHANGED from 90: softer pivot
+const float SHARP_BASE_PWM = 40.0f;    // CHANGED from 20: keep moving forward while pivoting (-40 / +120)
 const float TURN_LIMIT = 150.0f;
+// ADDED: SMOOTH PROGRESSIVE STEERING. Extra turn that grows with error SQUARED:
+// barely changes small corrections, but gets strong in sharp curves, with no
+// on/off switch. Extra turn = SHARP_GAIN x error x |error| (sensor units).
+//   error 1 -> +4    error 2 -> +16    error 3 -> +36    error 4 -> +64
+const float SHARP_GAIN = 4.0f;
 // ADDED: STRAIGHT-LINE BOOST. On straights (small error) speed ramps up
 // quickly; the moment the error grows (a curve is coming) the boost is cut
 // to zero and the car briefly brakes before the curve.
@@ -374,7 +379,8 @@ void loop() {
   }
   integral = limitFloat(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
 
-  lastTurn = STEERING_SIGN * (KP * pdError + KI * integral + KD * pdDelta);
+  lastTurn = STEERING_SIGN * (KP * pdError + KI * integral + KD * pdDelta
+                              + SHARP_GAIN * error * fabsf(error));   // ADDED: progressive term
   lastTurn = limitFloat(lastTurn, -MAX_TURN, MAX_TURN);   // CHANGED: was +/-BASE_PWM
 
   // ADDED: slow down the bigger the error, so the car can make tight curves.
