@@ -11,7 +11,7 @@ const uint8_t START_BUTTON = 73, STOP_BUTTON = 74;
 const uint8_t STATUS_LED = 41;
 
 // First parameters to tune. PWM uses 0..255, not percent.
-const float BASE_PWM = 45.0f;
+const float BASE_PWM = 90.0f;   // CHANGED from 45: your tested speed
 const float STEERING_ERROR_PERCENT = 150.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
 const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..10.
 // ADDED (PID): integral term. It builds up while the car stays on one side of
@@ -26,8 +26,8 @@ const float STEERING_SIGN = 1.0f;
 const float LEFT_TRIM = 1.0f;
 const float RIGHT_TRIM = 1.0f;
 // ADDED for sharp turns:
-const float MAX_TURN = 70.0f;     // Turn limit. Above BASE_PWM lets the inner wheel spin BACKWARD (pivot).
-const float CURVE_SLOW = 2.0f;    // CHANGED: only mild slowing in curves (see SHARP mode)
+const float MAX_TURN = 120.0f;    // CHANGED from 70: at base 90, 70 could not slow the inner wheel below 20
+const float CURVE_SLOW = 6.0f;    // CHANGED from 2: at base 90 the car barely slowed in curves (T9)
 const float MIN_BASE_PWM = 35.0f; // CHANGED from 25: low PWM = low torque, sluggish turning
 const float RECOVERY_BASE_PWM = 0.0f;  // CHANGED from 10: pure pivot when the line is lost
 
@@ -36,11 +36,11 @@ const float RECOVERY_BASE_PWM = 0.0f;  // CHANGED from 10: pure pivot when the l
 // pivot HARD: inner wheel fast backward, outer wheel fast forward. The car
 // rotates quickly but barely moves forward, so it stays on the corner.
 // Hysteresis: enter at a large error, stay in until nearly re-centered.
-const float SHARP_ENTER_ERROR = 4.0f;  // |error| (sensor units, max ~7) to start the pivot
+const float SHARP_ENTER_ERROR = 3.0f;  // CHANGED from 4: start the pivot earlier at high speed
 const float SHARP_EXIT_ERROR = 1.5f;   // |error| to go back to normal PID
 const float SHARP_TURN = 90.0f;        // Pivot strength (PWM each way)
 const float SHARP_BASE_PWM = 20.0f;    // Forward part during the pivot -> wheels -70 / +110
-const float TURN_LIMIT = 120.0f;       // Absolute limit inside drive()
+const float TURN_LIMIT = 150.0f;       // CHANGED from 120: must be >= MAX_TURN
 const float SIDE_MEMORY_ERROR = 1.0f;  // ADDED: |error| needed to remember which side the line is on // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
