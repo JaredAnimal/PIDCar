@@ -19,7 +19,7 @@ const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..
 const float KI_TO_KP_RATIO = 3.0f;          // KI = 3 x KP, per second. Try 1..6.
 const float INTEGRAL_MAX_TURN = 25.0f;      // Most PWM the I term can ever add.
 const float INTEGRAL_DEADBAND = 80.0f;      // CHANGED from 300: now also removes a steady offset on straights.
-const float CENTER_OFFSET = 0.48509f; // From the supplied centered sample.
+const float CENTER_OFFSET = -0.815f; // CHANGED from 0.485: center check read -1.3, so 0.485 + (-1.3)
 const float STEERING_SIGN = 1.0f;
 // ADDED: motor trim. If the car drifts to one side on a straight, lower the
 // stronger side slightly (e.g. 0.95). 1.0 = no change.
