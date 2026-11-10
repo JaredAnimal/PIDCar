@@ -12,15 +12,22 @@ const uint8_t STATUS_LED = 41;
 
 // First parameters to tune. PWM uses 0..255, not percent.
 const float BASE_PWM = 45.0f;
-const float STEERING_ERROR_PERCENT = 50.0f; // Starting P correction at maximum error.
+const float STEERING_ERROR_PERCENT = 150.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
 const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..10.
 // ADDED (PID): integral term. It builds up while the car stays on one side of
 // the line (a long or sharp curve), adding extra turn the longer the curve lasts.
 const float KI_TO_KP_RATIO = 3.0f;          // KI = 3 x KP, per second. Try 1..6.
 const float INTEGRAL_MAX_TURN = 25.0f;      // Most PWM the I term can ever add.
-const float INTEGRAL_DEADBAND = 300.0f;     // Ignore small errors (0..2000 scale) so straights don't wind up.
+const float INTEGRAL_DEADBAND = 80.0f;      // CHANGED from 300: now also removes a steady offset on straights.
 const float CENTER_OFFSET = 0.48509f; // From the supplied centered sample.
 const float STEERING_SIGN = 1.0f;
+// ADDED: motor trim. If the car drifts to one side on a straight, lower the
+// stronger side slightly (e.g. 0.95). 1.0 = no change.
+const float LEFT_TRIM = 1.0f;
+const float RIGHT_TRIM = 1.0f;
+// ADDED: centering check. true = motors OFF, prints error over Serial (9600).
+// Put the car exactly centered on the line: error should read about 0.
+const bool CENTER_CHECK = false;
 // ADDED for sharp turns:
 const float MAX_TURN = 70.0f;     // Turn limit. Above BASE_PWM lets the inner wheel spin BACKWARD (pivot).
 const float CURVE_SLOW = 3.0f;    // PWM removed from base speed per unit of |error| (slow down in curves).
@@ -97,8 +104,8 @@ void setWheel(uint8_t dirPin, uint8_t pwmPin, float cmd) {
 void drive(float turn, float base) {
   // Positive error = line to the left: slow the left wheel, speed up the right.
   turn = limitFloat(turn, -MAX_TURN, MAX_TURN);
-  setWheel(LEFT_DIR, LEFT_PWM, base - turn);
-  setWheel(RIGHT_DIR, RIGHT_PWM, base + turn);
+  setWheel(LEFT_DIR, LEFT_PWM, (base - turn) * LEFT_TRIM);    // CHANGED: trim
+  setWheel(RIGHT_DIR, RIGHT_PWM, (base + turn) * RIGHT_TRIM);
   digitalWrite(LEFT_SLEEP, HIGH);
   digitalWrite(RIGHT_SLEEP, HIGH);
 }
@@ -150,6 +157,7 @@ void setup() {
   digitalWrite(STATUS_LED, LOW);
   ECE3_Init();
   stopMotors();
+  Serial.begin(9600);    // ADDED: for CENTER_CHECK
   state = START_DELAY;   // skip the button wait
   startMs = millis();    // start the delay timer
 }
@@ -282,6 +290,18 @@ void loop() {
   if (!finishArmed && ++clearReads >= CLEAR_READS_TO_ARM &&
       (barsSeen == 0 || encoderAverage() >= REARM_COUNTS)) finishArmed = true;
   const float error = float(weighted) / float(sum) - CENTER_OFFSET;
+
+  // ADDED: centering check mode. No driving; print the error 5x per second.
+  if (CENTER_CHECK) {
+    stopMotors();
+    static uint32_t lastPrintMs = 0;
+    if (nowMs - lastPrintMs >= 200) {
+      lastPrintMs = nowMs;
+      Serial.print("error = ");
+      Serial.println(error, 3);
+    }
+    return;
+  }
   float delta = 0.0f;
   if (derivativeReady) {
     delta = (error - previousError) * (float(SAMPLE_US) / float(elapsedUs));
