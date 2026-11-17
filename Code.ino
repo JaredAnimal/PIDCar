@@ -1,5 +1,6 @@
 // ECE3 line follower (PID): turn at the first confirmed bar and stop at the second.
-// Starts automatically after a one-second countdown. Reset for another run.
+// v9: median calibration, left motor trim 0.98, 2 s start delay, full-speed turnaround.
+// Starts automatically after a two-second countdown. Reset for another run.
 // Gains and thresholds need track testing.
 #include <Arduino.h>
 #include <ECE3.h>
@@ -19,11 +20,11 @@ const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..
 const float KI_TO_KP_RATIO = 3.0f;          // KI = 3 x KP, per second. Try 1..6.
 const float INTEGRAL_MAX_TURN = 25.0f;      // Most PWM the I term can ever add.
 const float INTEGRAL_DEADBAND = 80.0f;      // CHANGED from 300: now also removes a steady offset on straights.
-const float CENTER_OFFSET = 0.48509f; // From the calibration spreadsheet (ERROR = 0 row).
+const float CENTER_OFFSET = 0.338f;  // CHANGED: from the NEW median calibration (ERROR = 0 row). Was 0.48509.
 const float STEERING_SIGN = 1.0f;
 // ADDED: motor trim. If the car drifts to one side on a straight, lower the
 // stronger side slightly (e.g. 0.95). 1.0 = no change.
-const float LEFT_TRIM = 1.0f;
+const float LEFT_TRIM = 0.98f;   // Left motor is faster than the right: left PWM x 0.98 everywhere
 const float RIGHT_TRIM = 1.0f;
 // ADDED for sharp turns:
 const float MAX_TURN = 120.0f;    // CHANGED from 70: at base 90, 70 could not slow the inner wheel below 20
@@ -68,16 +69,20 @@ const uint8_t BAR_CONFIRM_READS = 2;  // Reject a one-sample all-black glitch.
 const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
 
 // ADDED: 180-degree turnaround at the FIRST bar, stop at the SECOND bar.
-const int TURN_PWM = 60;              // Spin speed for the turnaround.
+const int TURN_PWM = 255;             // CHANGED from 60: full speed for the turnaround spin.
+const int TURN_FINISH_PWM = 80;       // ADDED: slower for the last part of the spin, so it stops on target
+const long TURN_SLOWDOWN_COUNTS = 90; // ADDED: switch to TURN_FINISH_PWM this many counts before the end
 const long TURN_COUNTS = 360;         // Encoder counts per wheel for 180 deg. INITIAL GUESS: tune on the floor.
-const uint32_t TURN_TIMEOUT_MS = 2000;// Backstop if the encoders don't count.
+const uint32_t TURN_TIMEOUT_MS = 1500;// Backstop if the encoders don't count.
 const long REARM_COUNTS = 300;        // Distance to drive after turning before the next bar can count.
 const uint8_t CLEAR_READS_TO_ARM = 10;
+const uint32_t START_DELAY_MS = 2000; // ADDED: wait 2 s after power-on/reset before driving
 
 // S1..S8 in the spreadsheet = raw indices 0..7 in the calibration sketch.
 // The supplied starter identifies that order as RIGHT to LEFT.
-const int SENSOR_MIN[8] = {772, 657, 612, 612, 567, 612, 635, 797};
-const int SENSOR_MAX[8] = {2500, 2469, 2500, 1934, 2027, 1911, 2500, 2500};
+// CHANGED: NEW calibration = median of runs 1-3 ("Initial Data Median" sheet).
+const int SENSOR_MIN[8] = {772, 612, 544, 567, 544, 634, 658, 773};
+const int SENSOR_MAX[8] = {2500, 2446, 2500, 1911, 1935, 1865, 2493, 2500};
 const int POSITION[8] = {-7, -5, -3, -1, 1, 3, 5, 7};
 
 // Scale PD to a maximum absolute error of 2000 for the professor's gain rule.
@@ -154,8 +159,8 @@ void resetEncoders() {
 // ADDED: start spinning in place (left wheel back, right wheel forward).
 void startTurn(uint32_t nowMs) {
   resetEncoders();
-  setWheel(LEFT_DIR, LEFT_PWM, -TURN_PWM);
-  setWheel(RIGHT_DIR, RIGHT_PWM, TURN_PWM);
+  setWheel(LEFT_DIR, LEFT_PWM, -TURN_PWM * LEFT_TRIM);     // CHANGED: trim here too
+  setWheel(RIGHT_DIR, RIGHT_PWM, TURN_PWM * RIGHT_TRIM);
   digitalWrite(LEFT_SLEEP, HIGH);
   digitalWrite(RIGHT_SLEEP, HIGH);
   turnStartMs = nowMs;
@@ -220,7 +225,7 @@ void loop() {
   }
   if (state == START_DELAY) {
     digitalWrite(STATUS_LED, (nowMs / 500) % 2);
-    if (nowMs - startMs < 1000) return;
+    if (nowMs - startMs < START_DELAY_MS) return;   // CHANGED: was 1000
     state = TRACKING;
     startMs = lastSeenMs = nowMs;
     lastSampleUs = micros();
@@ -230,7 +235,14 @@ void loop() {
   // ADDED: turnaround in progress. Non-blocking: check encoders each loop.
   if (state == TURNING) {
     digitalWrite(STATUS_LED, (nowMs / 100) % 2);
-    if (encoderAverage() >= TURN_COUNTS || nowMs - turnStartMs >= TURN_TIMEOUT_MS) {
+    // ADDED: full speed for most of the spin, then slow down near the end
+    // so momentum doesn't carry the car past 180 degrees.
+    const long turned = encoderAverage();
+    if (turned >= TURN_COUNTS - TURN_SLOWDOWN_COUNTS) {
+      setWheel(LEFT_DIR, LEFT_PWM, -TURN_FINISH_PWM * LEFT_TRIM);
+      setWheel(RIGHT_DIR, RIGHT_PWM, TURN_FINISH_PWM * RIGHT_TRIM);
+    }
+    if (turned >= TURN_COUNTS || nowMs - turnStartMs >= TURN_TIMEOUT_MS) {
       analogWrite(LEFT_PWM, 0);
       analogWrite(RIGHT_PWM, 0);
       digitalWrite(LEFT_DIR, LOW);     // both forward again
