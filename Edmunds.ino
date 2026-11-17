@@ -1,26 +1,109 @@
-// Straight-drive PWM sweep for the MSP432 / TI-RSLK MAX.
-// Starts automatically after one second. Switch motor power off to stop.
-// Right: 0..255. Left: 0.98 x right, rounded to a whole PWM value.
-// Holds each step for PWM_STEP_MS, then stays at the maximum until stopped.
+// U track: filtered PD, sensor-triggered braking, and fading right-pivot help.
+// Automatic start after one second. Stop manually with motor power.
 #include <Arduino.h>
+#include <ECE3.h>
+#include <math.h>
 
+const float CENTER_OFFSET = 0.48509f;
+const float STEERING_SIGN = 1.0f;
+const float LEFT_TRIM = 0.98f; // Left motor is faster; apply once after steering.
+
+const float STRAIGHT_PWM = 255.0f; // Maximum reached after steady tracking.
+const float UNSETTLED_PWM = 160.0f;
+const float SIGNAL_LOSS_PWM = 80.0f;
+const float START_PWM = 100.0f;
+const float ACCEL_STEP_PWM = 6.0f; // Per nominal 6 ms sample; previous trial used 4.
+const float MAX_STRAIGHT_TURN = 40.0f;
+const uint8_t STABLE_READS_FOR_FAST = 12; //DECREASE to 8 from 12
+
+const float BEND_PWM = 80.0f; // Curve-only trial; straight settings stay as tested.
+// Hold the steering reference at 70 while increasing forward command to 80.
+// Do not automatically increase steering aggressiveness with curve speed.
+const float BEND_TUNING_PWM = 70.0f;
+const float BEND_COMMAND_SCALE = BEND_TUNING_PWM / 45.0f;
+const float BEND_P_GAIN_SCALE = 0.90f; // 10% less P for observed right overshoot.
+const float PIVOT_HELP_SCALE = 0.90f;  // Soften the pivot floor as well as P.
+const float RIGHT_TURN_ERROR = 1.5f;
+const int BEND_SENSOR_LEVEL = 500;
+const uint8_t BEND_CONFIRM_READS = 2;
+const int EDGE_BOOST_START = 400; // Normalized darkness where extra weight begins.
+const float REVERSE_TURN = 70.0f * BEND_COMMAND_SCALE * PIVOT_HELP_SCALE;
+const float PIVOT_RELEASE_ERROR = 0.8f; // Release help earlier; previous trial used 0.5.
+const float PIVOT_FULL_ERROR = 3.5f;    // Full help with the line far to the right.
+const float MAX_BEND_TURN = 110.0f * BEND_COMMAND_SCALE;
+const uint8_t STRAIGHT_READS_AFTER_BEND = 12;//DECRESE TO 12 from 20
+
+const float STRAIGHT_ERROR_PERCENT = 25.0f;
+const float BEND_ERROR_PERCENT = 50.0f; // Reference proportional tuning at 45 PWM.
+const float STRAIGHT_KD_TO_KP_RATIO = 7.5f;
+const float BEND_REFERENCE_KD_TO_KP_RATIO = 7.5f;
+const float BEND_D_GAIN_SCALE = 1.10f; // Retain damping while reducing right-turn force.
+const float DERIVATIVE_ALPHA = 0.35f;
+const uint32_t SAMPLE_US = 6000, START_DELAY_MS = 1000;
 const uint8_t LEFT_SLEEP = 31, LEFT_DIR = 29, LEFT_PWM = 40;
 const uint8_t RIGHT_SLEEP = 11, RIGHT_DIR = 30, RIGHT_PWM = 39;
 const uint8_t STATUS_LED = 41;
-const float LEFT_TRIM = 0.98f;
-const uint16_t MAX_PWM = 255;
-const uint32_t PWM_STEP_MS = 100;  // +1 PWM every 0.1 s: 0 to 255 in 25.5 s.
-const uint32_t START_DELAY_MS = 1000;
 
-uint32_t startMs = 0, lastStepMs = 0;
-uint16_t commandPwm = 0;
-bool motorsRunning = false;
+// Raw indices run from right to left.
+const int SENSOR_MIN[8] = {772, 657, 612, 612, 567, 612, 635, 797};
+const int SENSOR_MAX[8] = {2500, 2469, 2500, 1934, 2027, 1911, 2500, 2500};
+const int ALIGN_WEIGHTS[8] = {-7, -5, -3, -1, 1, 3, 5, 7};
+const int TURN_WEIGHTS[8] = {-35, -12, -3, -1, 1, 3, 12, 35};
+// Use the alignment scale for both errors so the edge boost adds authority.
+const float MAX_ERROR = fmaxf(fabsf(float(ALIGN_WEIGHTS[0]) - CENTER_OFFSET),
+                             fabsf(float(ALIGN_WEIGHTS[7]) - CENTER_OFFSET));
+const float ERROR_SCALE = 2000.0f / MAX_ERROR;
+const float STRAIGHT_KP = (STRAIGHT_ERROR_PERCENT / 100.0f) * STRAIGHT_PWM / 2000.0f;
+const float STRAIGHT_KD = STRAIGHT_KD_TO_KP_RATIO * STRAIGHT_KP;
+const float BEND_REFERENCE_KP = (BEND_ERROR_PERCENT / 100.0f) * STRAIGHT_PWM / 2000.0f;
+const float BEND_KP = BEND_REFERENCE_KP * BEND_COMMAND_SCALE * BEND_P_GAIN_SCALE;
+// D has its own scale so bend damping can be tuned independently of speed/P.
+// User observed right overshoot before left correction; hold D for this trial.
+const float BEND_KD = BEND_REFERENCE_KD_TO_KP_RATIO * BEND_REFERENCE_KP * BEND_D_GAIN_SCALE;
 
-void applyPwm() {
-  // Round instead of truncating: at command 255, left = 250, right = 255.
-  const int leftPwm = (int)(LEFT_TRIM * commandPwm + 0.5f);
-  analogWrite(LEFT_PWM, leftPwm);
-  analogWrite(RIGHT_PWM, commandPwm);
+uint16_t raw[8];
+uint32_t startMs = 0, lastSampleUs = 0;
+uint8_t leftDirection = LOW, rightDirection = LOW;
+uint8_t stableReads = 0, bendReads = 0;
+bool bendSeen = false, bendDone = false, derivativeReady = false;
+bool edgeWeightsArmed = false;
+float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
+float basePwm = START_PWM;
+
+float limitFloat(float value, float low, float high) {
+  return value < low ? low : (value > high ? high : value);
+}
+
+float bendProportionalTurn(float proportionalTurn, float alignmentError) {
+  // Fade the minimum right-pivot request smoothly using the regular centroid.
+  // This is independent of the sharpRight detection threshold, so moving
+  // between two sensor channels cannot switch the pivot help on/off abruptly.
+  const float rightError = -STEERING_SIGN * alignmentError;
+  float assistance = limitFloat((rightError - PIVOT_RELEASE_ERROR) /
+      (PIVOT_FULL_ERROR - PIVOT_RELEASE_ERROR), 0.0f, 1.0f);
+  assistance = assistance * assistance * (3.0f - 2.0f * assistance);
+  const float assistedTurn = fminf(proportionalTurn, -REVERSE_TURN);
+  return proportionalTurn + assistance * (assistedTurn - proportionalTurn);
+}
+
+void setWheel(uint8_t dirPin, uint8_t pwmPin, uint8_t &direction, float command) {
+  const uint8_t nextDirection = command < 0.0f ? HIGH : LOW;
+  if (nextDirection != direction) {
+    analogWrite(pwmPin, 0);
+    digitalWrite(dirPin, nextDirection);
+    direction = nextDirection;
+  }
+  const float magnitude = limitFloat(fabsf(command), 0.0f, 255.0f);
+  analogWrite(pwmPin, (int)(magnitude + 0.5f));
+}
+
+void drive(float turn, float base) {
+  // Keep the requested steering differential inside the PWM range.
+  base = fminf(base, 255.0f - fabsf(turn));
+  setWheel(LEFT_DIR, LEFT_PWM, leftDirection, (base - turn) * LEFT_TRIM);
+  setWheel(RIGHT_DIR, RIGHT_PWM, rightDirection, base + turn);
+  digitalWrite(LEFT_SLEEP, HIGH);
+  digitalWrite(RIGHT_SLEEP, HIGH);
 }
 
 void setup() {
@@ -28,46 +111,128 @@ void setup() {
   pinMode(RIGHT_SLEEP, OUTPUT);
   digitalWrite(LEFT_SLEEP, LOW);
   digitalWrite(RIGHT_SLEEP, LOW);
-
   pinMode(LEFT_DIR, OUTPUT);
   pinMode(RIGHT_DIR, OUTPUT);
-  digitalWrite(LEFT_DIR, LOW);  // LOW = forward on the stock RSLK.
-  digitalWrite(RIGHT_DIR, LOW);
-
   pinMode(LEFT_PWM, OUTPUT);
   pinMode(RIGHT_PWM, OUTPUT);
+  digitalWrite(LEFT_DIR, LOW);
+  digitalWrite(RIGHT_DIR, LOW);
   analogWrite(LEFT_PWM, 0);
   analogWrite(RIGHT_PWM, 0);
-
   pinMode(STATUS_LED, OUTPUT);
-  digitalWrite(STATUS_LED, LOW);
+  ECE3_Init();
   startMs = millis();
+  lastSampleUs = micros();
 }
 
 void loop() {
-  const uint32_t nowMs = millis();
-  if (!motorsRunning) {
-    const uint32_t elapsedMs = nowMs - startMs;
-    if (elapsedMs < START_DELAY_MS) {
-      digitalWrite(STATUS_LED, (elapsedMs / 250) % 2);
-      return;
-    }
-
-    commandPwm = 0;
-    applyPwm();
-    digitalWrite(LEFT_SLEEP, HIGH);
-    digitalWrite(RIGHT_SLEEP, HIGH);
-    digitalWrite(STATUS_LED, HIGH);
-    lastStepMs = nowMs;
-    motorsRunning = true;
+  const uint32_t sinceStartMs = millis() - startMs;
+  if (sinceStartMs < START_DELAY_MS) {
+    digitalWrite(STATUS_LED, (sinceStartMs / 500) % 2);
     return;
   }
+  const uint32_t nowUs = micros();
+  const uint32_t elapsedUs = nowUs - lastSampleUs;
+  if (elapsedUs < SAMPLE_US) return;
+  lastSampleUs = nowUs;
 
-  if (commandPwm < MAX_PWM && nowMs - lastStepMs >= PWM_STEP_MS) {
-    // Advance only one step so a delayed loop never skips a PWM value.
-    commandPwm+=8;
-    lastStepMs = nowMs;
-    applyPwm();
+  bool slow = bendSeen && !bendDone;
+  ECE3_read_IR(raw);
+  int sum = 0, weighted = 0, turnWeighted = 0, peak = 0, rightShoulderPeak = 0;
+  uint8_t darkSensors = 0, lineSensors = 0;
+  for (uint8_t i = 0; i < 8; ++i) {
+    int value = (int32_t(raw[i]) - SENSOR_MIN[i]) * 1000L /
+                (SENSOR_MAX[i] - SENSOR_MIN[i]);
+    if (value < 0) value = 0;
+    if (value > 1000) value = 1000;
+    sum += value;
+    weighted += ALIGN_WEIGHTS[i] * value;
+    // Ramp the extra edge weight above the noise guard. At darkness 1000
+    // each channel reaches its TURN_WEIGHTS value.
+    const int edgeStrength = value > EDGE_BOOST_START ?
+        (value - EDGE_BOOST_START) * 1000 / (1000 - EDGE_BOOST_START) : 0;
+    turnWeighted += ALIGN_WEIGHTS[i] * value +
+                    (TURN_WEIGHTS[i] - ALIGN_WEIGHTS[i]) * edgeStrength;
+    if (value > peak) peak = value;
+    if (i <= 2 && value > rightShoulderPeak) rightShoulderPeak = value;
+    if (value >= 700) ++darkSensors;
+    if (value >= 220) ++lineSensors;
   }
-  // At 255, PWM hardware holds the final commands until motor power is off.
+
+  const bool validLine = peak >= 220 && sum >= 300 && darkSensors < 8;
+  if (validLine) {
+    const float alignmentError = float(weighted) / float(sum) - CENTER_OFFSET;
+    const float error = edgeWeightsArmed ?
+        float(turnWeighted) / float(sum) - CENTER_OFFSET : alignmentError;
+    const bool sharpRight = STEERING_SIGN * alignmentError <= -RIGHT_TURN_ERROR &&
+                            rightShoulderPeak >= BEND_SENSOR_LEVEL;
+    const bool bendCandidate = edgeWeightsArmed && !bendDone && sharpRight;
+    // Brake on the first candidate. Confirm a second valid right-side
+    // pattern before allowing the right wheel to reverse.
+    if (bendCandidate) slow = true;
+    if (bendCandidate && !bendSeen) {
+      if (++bendReads >= BEND_CONFIRM_READS) {
+        bendSeen = true;
+        stableReads = 0;
+      }
+    } else {
+      bendReads = 0;
+    }
+
+    float delta = 0.0f;
+    if (derivativeReady) {
+      delta = (error - previousError) * (float(SAMPLE_US) / float(elapsedUs));
+    }
+    filteredDelta += DERIVATIVE_ALPHA * (delta - filteredDelta);
+    previousError = error;
+    derivativeReady = true;
+    const bool inBend = slow && bendSeen;
+    const float kp = inBend ? BEND_KP : STRAIGHT_KP;
+    const float kd = inBend ? BEND_KD : STRAIGHT_KD;
+    float proportionalTurn = STEERING_SIGN * kp * error * ERROR_SCALE;
+    if (inBend) {
+      proportionalTurn = bendProportionalTurn(proportionalTurn, alignmentError);
+    }
+    // Add D AFTER the pivot help, so damping can ease the right turn while
+    // the line is still on the right. Do not force a minimum on the final PD
+    // output: that previously overrode damping and encouraged overshoot.
+    lastTurn = proportionalTurn + STEERING_SIGN * kd * filteredDelta * ERROR_SCALE;
+
+    const bool settled = fabsf(alignmentError) <= 0.5f &&
+                         fabsf(filteredDelta) <= 0.10f &&
+                         fabsf(lastTurn) <= 10.0f && lineSensors <= 4;
+    if (!settled) stableReads = 0;
+    else if (stableReads < 255) ++stableReads;
+    if (inBend && stableReads >= STRAIGHT_READS_AFTER_BEND) {
+      bendDone = true;
+      slow = false;
+      lastTurn = STEERING_SIGN * (STRAIGHT_KP * error +
+                                 STRAIGHT_KD * filteredDelta) * ERROR_SCALE;
+    }
+    if (!edgeWeightsArmed && stableReads >= STABLE_READS_FOR_FAST) {
+      edgeWeightsArmed = true;
+      // Changing the weight map must not create a derivative kick.
+      derivativeReady = false;
+      filteredDelta = 0.0f;
+    }
+  } else {
+    stableReads = bendReads = 0;
+    derivativeReady = false;
+    filteredDelta = 0.0f;
+    // A dropout slows the car and releases stale straight-line steering.
+    lastTurn = slow && bendSeen ? -REVERSE_TURN : 0.8f * lastTurn;
+  }
+
+  float targetPwm = stableReads >= STABLE_READS_FOR_FAST ? STRAIGHT_PWM :
+                   fminf(STRAIGHT_PWM, UNSETTLED_PWM);
+  if (slow) targetPwm = BEND_PWM;
+  if (!validLine) targetPwm = fminf(targetPwm, SIGNAL_LOSS_PWM);
+  basePwm = fminf(targetPwm, basePwm + ACCEL_STEP_PWM);
+  // Both wheels stay forward outside the confirmed bend.
+  const float turnLimit = slow && bendSeen ? MAX_BEND_TURN :
+                          fminf(MAX_STRAIGHT_TURN, basePwm);
+  lastTurn = limitFloat(lastTurn, -turnLimit, turnLimit);
+  digitalWrite(STATUS_LED, slow ? (sinceStartMs / 100) % 2 : HIGH);
+  drive(lastTurn, basePwm);
 }
+
