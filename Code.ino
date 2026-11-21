@@ -13,14 +13,14 @@ const uint8_t STATUS_LED = 41;
 
 // First parameters to tune. PWM uses 0..255, not percent.
 const float BASE_PWM = 90.0f;   // CHANGED from 45: your tested speed
-const float STEERING_ERROR_PERCENT = 150.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
-const float KD_TO_KP_RATIO = 7.5f;          // Professor's starting range is 5..10.
+const float STEERING_ERROR_PERCENT = 165.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
+const float KD_TO_KP_RATIO = 6.82f;          // Professor's starting range is 5..10.
 // ADDED (PID): integral term. It builds up while the car stays on one side of
 // the line (a long or sharp curve), adding extra turn the longer the curve lasts.
-const float KI_TO_KP_RATIO = 3.0f;          // KI = 3 x KP, per second. Try 1..6.
+const float KI_TO_KP_RATIO = 2.73f;          // KI = 3 x KP, per second. Try 1..6.
 const float INTEGRAL_MAX_TURN = 25.0f;      // Most PWM the I term can ever add.
 const float INTEGRAL_DEADBAND = 80.0f;      // CHANGED from 300: now also removes a steady offset on straights.
-const float CENTER_OFFSET = 0.338f;  // CHANGED: from the NEW median calibration (ERROR = 0 row). Was 0.48509.
+const float CENTER_OFFSET = -0.0565749235f;  // New-car calibration with existing POSITION weights and integer normalization.
 const float STEERING_SIGN = 1.0f;
 // ADDED: motor trim. If the car drifts to one side on a straight, lower the
 // stronger side slightly (e.g. 0.95). 1.0 = no change.
@@ -52,7 +52,7 @@ const float SHARP_GAIN = 4.0f;
 // to zero and the car briefly brakes before the curve.
 const float STRAIGHT_ERROR = 0.8f;    // |error| below this = straight: ramp up
 const float BOOST_DROP_ERROR = 1.5f;  // |error| above this = curve: cut boost to 0 at once
-const float BOOST_MAX = 60.0f;        // Extra PWM on long straights (90 + 60 = 150)
+const float BOOST_MAX = 150.0f;        // Extra PWM on long straights (90 + 60 = 150)
 const float BOOST_RAMP_UP = 150.0f;   // PWM gained per second (0 -> 60 in 0.4 s)
 const float BOOST_DECAY = 300.0f;     // PWM lost per second between the two thresholds
 const float BRAKE_MIN_BOOST = 20.0f;  // Only brake if boost was at least this high
@@ -63,7 +63,7 @@ const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigat
 const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course needs it.
 const int MIN_LINE_PEAK = 220;       // Normalized 0..1000. Initial guess.
 const int MIN_LINE_SUM = 300;
-const int BAR_DARK_LEVEL = 700;
+const int BAR_DARK_LEVEL = 600; //DANGER DANGER should be 650
 const uint8_t BAR_SENSOR_COUNT = 8;   // All eight sensors must see black.
 const uint8_t BAR_CONFIRM_READS = 2;  // Reject a one-sample all-black glitch.
 const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
@@ -80,9 +80,9 @@ const uint32_t START_DELAY_MS = 2000; // ADDED: wait 2 s after power-on/reset be
 
 // S1..S8 in the spreadsheet = raw indices 0..7 in the calibration sketch.
 // The supplied starter identifies that order as RIGHT to LEFT.
-// CHANGED: NEW calibration = median of runs 1-3 ("Initial Data Median" sheet).
-const int SENSOR_MIN[8] = {772, 612, 544, 567, 544, 634, 658, 773};
-const int SENSOR_MAX[8] = {2500, 2446, 2500, 1911, 1935, 1865, 2493, 2500};
+// New-car sensor calibration; sensor order remains RIGHT to LEFT.
+const int SENSOR_MIN[8] = {771, 759, 681, 726, 521, 612, 657, 703};
+const int SENSOR_MAX[8] = {2500, 2500, 2500, 2091, 1909, 2500, 2500, 2500};
 const int POSITION[8] = {-7, -5, -3, -1, 1, 3, 5, 7};
 
 // Scale PD to a maximum absolute error of 2000 for the professor's gain rule.
