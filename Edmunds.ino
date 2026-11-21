@@ -4,7 +4,7 @@
 #include <ECE3.h>
 #include <math.h>
 
-const float CENTER_OFFSET = 0.48509f;
+const float CENTER_OFFSET = -0.0565749235f;
 const float STEERING_SIGN = 1.0f;
 const float LEFT_TRIM = 0.98f; // Left motor is faster; apply once after steering.
 
@@ -23,8 +23,8 @@ const float BEND_TUNING_PWM = 70.0f;
 const float BEND_COMMAND_SCALE = BEND_TUNING_PWM / 45.0f;
 const float BEND_P_GAIN_SCALE = 0.90f; // 10% less P for observed right overshoot.
 const float PIVOT_HELP_SCALE = 0.90f;  // Soften the pivot floor as well as P.
-const float RIGHT_TURN_ERROR = 1.5f;
-const int BEND_SENSOR_LEVEL = 500;
+const float RIGHT_TURN_ERROR = 4.0f; // Less sensitive than the original 1.5.
+const int BEND_SENSOR_LEVEL = 650; // Stronger right-side signal than original 500.
 const uint8_t BEND_CONFIRM_READS = 2;
 const int EDGE_BOOST_START = 400; // Normalized darkness where extra weight begins.
 const float REVERSE_TURN = 70.0f * BEND_COMMAND_SCALE * PIVOT_HELP_SCALE;
@@ -45,8 +45,8 @@ const uint8_t RIGHT_SLEEP = 11, RIGHT_DIR = 30, RIGHT_PWM = 39;
 const uint8_t STATUS_LED = 41;
 
 // Raw indices run from right to left.
-const int SENSOR_MIN[8] = {772, 657, 612, 612, 567, 612, 635, 797};
-const int SENSOR_MAX[8] = {2500, 2469, 2500, 1934, 2027, 1911, 2500, 2500};
+const int SENSOR_MIN[8] = {771, 759, 681, 726, 521, 612, 657, 703};
+const int SENSOR_MAX[8] = {2500, 2500, 2500, 2091, 1909, 2500, 2500, 2500};
 const int ALIGN_WEIGHTS[8] = {-7, -5, -3, -1, 1, 3, 5, 7};
 const int TURN_WEIGHTS[8] = {-35, -12, -3, -1, 1, 3, 12, 35};
 // Use the alignment scale for both errors so the edge boost adds authority.
@@ -67,11 +67,34 @@ uint8_t leftDirection = LOW, rightDirection = LOW;
 uint8_t stableReads = 0, bendReads = 0;
 bool bendSeen = false, bendDone = false, derivativeReady = false;
 bool edgeWeightsArmed = false;
+bool bendCandidateSeen = false;
+uint32_t lastBendCandidateMs = 0;
 float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
 float basePwm = START_PWM;
 
 float limitFloat(float value, float low, float high) {
   return value < low ? low : (value > high ? high : value);
+}
+
+void updateStatusLed(uint32_t nowMs, bool validLine) {
+  // Controller state only: "done" does not prove a physical U-turn occurred.
+  // Slow blink = last turn finished, detection still enabled.
+  // Fast blink = confirmed turn active.
+  // Double flash = candidate, held visible for 800 ms after the last candidate.
+  // Solid = valid line, detection available; off = no valid line before a turn.
+  bool on;
+  if (bendDone) {
+    on = (nowMs % 1000) < 500;
+  } else if (bendSeen) {
+    on = (nowMs % 200) < 100;
+  } else if (bendCandidateSeen &&
+             uint32_t(nowMs - lastBendCandidateMs) < 800) {
+    const uint32_t phase = uint32_t(nowMs - lastBendCandidateMs);
+    on = phase < 100 || (phase >= 200 && phase < 300);
+  } else {
+    on = validLine;
+  }
+  digitalWrite(STATUS_LED, on ? HIGH : LOW);
 }
 
 float bendProportionalTurn(float proportionalTurn, float alignmentError) {
@@ -128,7 +151,7 @@ void setup() {
 void loop() {
   const uint32_t sinceStartMs = millis() - startMs;
   if (sinceStartMs < START_DELAY_MS) {
-    digitalWrite(STATUS_LED, (sinceStartMs / 500) % 2);
+    digitalWrite(STATUS_LED, LOW); // Off during the one-second startup delay.
     return;
   }
   const uint32_t nowUs = micros();
@@ -166,10 +189,15 @@ void loop() {
         float(turnWeighted) / float(sum) - CENTER_OFFSET : alignmentError;
     const bool sharpRight = STEERING_SIGN * alignmentError <= -RIGHT_TURN_ERROR &&
                             rightShoulderPeak >= BEND_SENSOR_LEVEL;
-    const bool bendCandidate = edgeWeightsArmed && !bendDone && sharpRight;
+    const bool bendCandidate = sharpRight; // Allow subsequent turns after settling.
     // Brake on the first candidate. Confirm a second valid right-side
     // pattern before allowing the right wheel to reverse.
-    if (bendCandidate) slow = true;
+    if (bendCandidate) {
+      bendDone = false;
+      slow = true;
+      bendCandidateSeen = true;
+      lastBendCandidateMs = sinceStartMs;
+    }
     if (bendCandidate && !bendSeen) {
       if (++bendReads >= BEND_CONFIRM_READS) {
         bendSeen = true;
@@ -205,6 +233,9 @@ void loop() {
     else if (stableReads < 255) ++stableReads;
     if (inBend && stableReads >= STRAIGHT_READS_AFTER_BEND) {
       bendDone = true;
+      bendSeen = false; // Require fresh confirmation for the next turn.
+      bendReads = 0;
+      bendCandidateSeen = false;
       slow = false;
       lastTurn = STEERING_SIGN * (STRAIGHT_KP * error +
                                  STRAIGHT_KD * filteredDelta) * ERROR_SCALE;
@@ -232,7 +263,6 @@ void loop() {
   const float turnLimit = slow && bendSeen ? MAX_BEND_TURN :
                           fminf(MAX_STRAIGHT_TURN, basePwm);
   lastTurn = limitFloat(lastTurn, -turnLimit, turnLimit);
-  digitalWrite(STATUS_LED, slow ? (sinceStartMs / 100) % 2 : HIGH);
+  updateStatusLed(sinceStartMs, validLine);
   drive(lastTurn, basePwm);
 }
-
