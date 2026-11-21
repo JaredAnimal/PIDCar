@@ -14,7 +14,7 @@ const float SIGNAL_LOSS_PWM = 80.0f;
 const float START_PWM = 100.0f;
 const float ACCEL_STEP_PWM = 6.0f; // Per nominal 6 ms sample; previous trial used 4.
 const float MAX_STRAIGHT_TURN = 40.0f;
-const uint8_t STABLE_READS_FOR_FAST = 12; //DECREASE to 8 from 12
+const uint8_t STABLE_READS_FOR_FAST = 8; //DECREASE to 8 from 12
 
 const float BEND_PWM = 80.0f; // Curve-only trial; straight settings stay as tested.
 // Hold the steering reference at 70 while increasing forward command to 80.
