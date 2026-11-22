@@ -52,13 +52,17 @@ const float SHARP_GAIN = 4.0f;
 // quickly; the moment the error grows (a curve is coming) the boost is cut
 // to zero and the car briefly brakes before the curve.
 const float STRAIGHT_ERROR = 1.2f;    // CHANGED from 0.8 (uses SMOOTHED error): wobble no longer blocks the boost
-const float BOOST_DROP_ERROR = 2.5f;  // CHANGED from 1.5: raw |error| above this = curve: cut boost at once
+const float BOOST_DROP_ERROR = 3.0f;  // CHANGED from 2.5: raw |error| above this (CONFIRMED) = curve: cut boost
 const float BOOST_MAX = 150.0f;       // Extra PWM on long straights (90 + 150 = 240). Kept your value.
-const float BOOST_RAMP_UP = 250.0f;   // CHANGED from 150: PWM gained per second
+const float BOOST_RAMP_UP = 400.0f;   // CHANGED from 250: 0 -> 150 in ~0.4 s
 const float BOOST_DECAY = 0.0f;       // CHANGED from 300: HOLD the boost between thresholds (decay was killing it)
 const float BRAKE_MIN_BOOST = 40.0f;  // CHANGED from 20: brake only after real speed-up (no pulsing)
 const uint32_t BRAKE_MS = 60;         // Brake time: forward speed 0, steering still active
 const float STRAIGHT_FILTER = 0.1f;   // ADDED: smoothing of |error| for the straight test (~60 ms average)
+// ADDED: a curve must be seen this many readings IN A ROW (6 ms each) before
+// the boost is cut and the car brakes. One noisy spike on a straight no longer
+// triggers the brake. 3 readings = 18 ms (~3-4 cm at full boost).
+const uint8_t CURVE_CONFIRM_READS = 3;
 const float SIDE_MEMORY_ERROR = 1.0f;  // ADDED: |error| needed to remember which side the line is on // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
@@ -112,6 +116,7 @@ uint32_t turnStartMs = 0;
 float integral = 0.0f;
 float boost = 0.0f;                   // ADDED: current straight-line boost
 float smoothAbsError = 7.0f;          // ADDED: averaged |error|; starts high = not straight
+uint8_t curveReads = 0;               // ADDED: consecutive readings above BOOST_DROP_ERROR
 uint32_t brakeUntilMs = 0;            // ADDED: braking until this time
 bool sharpMode = false;               // ADDED: true while pivoting through a sharp corner
 int lastSide = 0;                     // ADDED: +1 / -1 = side the line was last clearly seen on
@@ -411,9 +416,17 @@ void loop() {
   // CHANGED: decide "straight" from the SMOOTHED error, so a wobbling car on a
   // straight still gets the boost. The curve cut still uses the RAW error.
   smoothAbsError += STRAIGHT_FILTER * (absError - smoothAbsError);
+  // CHANGED: count consecutive high-error readings; cut + brake only when confirmed.
   if (absError > BOOST_DROP_ERROR) {
+    if (curveReads < 255) ++curveReads;
+  } else {
+    curveReads = 0;
+  }
+  if (curveReads >= CURVE_CONFIRM_READS) {
     if (boost >= BRAKE_MIN_BOOST) brakeUntilMs = nowMs + BRAKE_MS;  // was fast: brake
-    boost = 0.0f;                                   // curve coming: cut at once
+    boost = 0.0f;                                   // confirmed curve: cut
+  } else if (absError > BOOST_DROP_ERROR) {
+    // not confirmed yet: hold the boost (don't add, don't cut)
   } else if (smoothAbsError < STRAIGHT_ERROR) {
     boost += BOOST_RAMP_UP * dt;                    // straight: speed up
   } else {
