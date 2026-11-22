@@ -12,9 +12,9 @@ const uint8_t START_BUTTON = 73, STOP_BUTTON = 74;
 const uint8_t STATUS_LED = 41;
 
 // First parameters to tune. PWM uses 0..255, not percent.
-const float BASE_PWM = 90.0f;   // CHANGED from 45: your tested speed
-const float STEERING_ERROR_PERCENT = 165.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
-const float KD_TO_KP_RATIO = 6.82f;          // Professor's starting range is 5..10.
+const float BASE_PWM = 120.0f;   // CHANGED from 45: your tested speed
+const float STEERING_ERROR_PERCENT = 160.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
+const float KD_TO_KP_RATIO = 7.0f;          // Professor's starting range is 5..10.
 // ADDED (PID): integral term. It builds up while the car stays on one side of
 // the line (a long or sharp curve), adding extra turn the longer the curve lasts.
 const float KI_TO_KP_RATIO = 2.73f;          // KI = 3 x KP, per second. Try 1..6.
@@ -24,7 +24,7 @@ const float CENTER_OFFSET = -0.0565749235f;  // New-car calibration with existin
 const float STEERING_SIGN = 1.0f;
 // ADDED: motor trim. If the car drifts to one side on a straight, lower the
 // stronger side slightly (e.g. 0.95). 1.0 = no change.
-const float LEFT_TRIM = 0.98f;   // Left motor is faster than the right: left PWM x 0.98 everywhere
+const float LEFT_TRIM = 1.0f;   // Left motor is faster than the right: left PWM x 0.98 everywhere
 const float RIGHT_TRIM = 1.0f;
 // ADDED for sharp turns:
 const float MAX_TURN = 120.0f;    // CHANGED from 70: at base 90, 70 could not slow the inner wheel below 20
@@ -46,13 +46,13 @@ const float TURN_LIMIT = 150.0f;
 // barely changes small corrections, but gets strong in sharp curves, with no
 // on/off switch. Extra turn = SHARP_GAIN x error x |error| (sensor units).
 //   error 1 -> +4    error 2 -> +16    error 3 -> +36    error 4 -> +64
-const float SHARP_GAIN = 4.0f;
+const float SHARP_GAIN = 7.0f;
 // ADDED: STRAIGHT-LINE BOOST. On straights (small error) speed ramps up
 // quickly; the moment the error grows (a curve is coming) the boost is cut
 // to zero and the car briefly brakes before the curve.
 const float STRAIGHT_ERROR = 0.8f;    // |error| below this = straight: ramp up
 const float BOOST_DROP_ERROR = 1.5f;  // |error| above this = curve: cut boost to 0 at once
-const float BOOST_MAX = 150.0f;        // Extra PWM on long straights (90 + 60 = 150)
+const float BOOST_MAX = 00.0f;        // Extra PWM on long straights (90 + 60 = 150)
 const float BOOST_RAMP_UP = 150.0f;   // PWM gained per second (0 -> 60 in 0.4 s)
 const float BOOST_DECAY = 300.0f;     // PWM lost per second between the two thresholds
 const float BRAKE_MIN_BOOST = 20.0f;  // Only brake if boost was at least this high
@@ -64,7 +64,7 @@ const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course ne
 const int MIN_LINE_PEAK = 220;       // Normalized 0..1000. Initial guess.
 const int MIN_LINE_SUM = 300;
 const int BAR_DARK_LEVEL = 550; //DANGER DANGER should be 650, then 600,
-const uint8_t BAR_SENSOR_COUNT = 8;   // All eight sensors must see black.
+const uint8_t BAR_SENSOR_COUNT = 6;   // All eight sensors must see black.
 const uint8_t BAR_CONFIRM_READS = 2;  // Reject a one-sample all-black glitch.
 const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
 
