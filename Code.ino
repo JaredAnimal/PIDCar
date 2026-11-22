@@ -1,6 +1,5 @@
 // ECE3 line follower (PID): turn at the first confirmed bar and stop at the second.
 // v9: median calibration, left motor trim 0.98, 2 s start delay, full-speed turnaround.
-// NEW BOOST: works on straights even with wobble; LED ON = boost active.
 // Starts automatically after a two-second countdown. Reset for another run.
 // Gains and thresholds need track testing.
 #include <Arduino.h>
@@ -29,8 +28,8 @@ const float LEFT_TRIM = 0.98f;   // Left motor is faster than the right: left PW
 const float RIGHT_TRIM = 1.0f;
 // ADDED for sharp turns:
 const float MAX_TURN = 120.0f;    // CHANGED from 70: at base 90, 70 could not slow the inner wheel below 20
-const float CURVE_SLOW = 6.0f;    // CHANGED from 2: at base 90 the car barely slowed in curves (T9)
-const float MIN_BASE_PWM = 35.0f; // CHANGED from 25: low PWM = low torque, sluggish turning
+const float CURVE_SLOW = 3.0f;    // CHANGED from 2: at base 90 the car barely slowed in curves (T9)
+const float MIN_BASE_PWM = 60.0f; // CHANGED from 25: low PWM = low torque, sluggish turning
 const float RECOVERY_BASE_PWM = 0.0f;  // CHANGED from 10: pure pivot when the line is lost
 
 // ADDED: SHARP-CORNER MODE (for the 135-degree turn).
@@ -40,8 +39,8 @@ const float RECOVERY_BASE_PWM = 0.0f;  // CHANGED from 10: pure pivot when the l
 // Hysteresis: enter at a large error, stay in until nearly re-centered.
 const float SHARP_ENTER_ERROR = 5.5f;  // CHANGED from 3: pivot is now only a SAFETY NET for extreme errors
 const float SHARP_EXIT_ERROR = 3.0f;   // CHANGED from 1.5: hand back to smooth steering sooner
-const float SHARP_TURN = 80.0f;        // CHANGED from 90: softer pivot
-const float SHARP_BASE_PWM = 40.0f;    // CHANGED from 20: keep moving forward while pivoting (-40 / +120)
+const float SHARP_TURN = 120.0f;        // CHANGED from 90: softer pivot
+const float SHARP_BASE_PWM = 120.0f;    // CHANGED from 20: keep moving forward while pivoting (-40 / +120)
 const float TURN_LIMIT = 150.0f;
 // ADDED: SMOOTH PROGRESSIVE STEERING. Extra turn that grows with error SQUARED:
 // barely changes small corrections, but gets strong in sharp curves, with no
@@ -51,26 +50,20 @@ const float SHARP_GAIN = 4.0f;
 // ADDED: STRAIGHT-LINE BOOST. On straights (small error) speed ramps up
 // quickly; the moment the error grows (a curve is coming) the boost is cut
 // to zero and the car briefly brakes before the curve.
-const float STRAIGHT_ERROR = 0.8f;    // Your tested value (smoothed error)
-const float BOOST_DROP_ERROR = 2.0f;  // CHANGED from 3.0: see a sharp curve coming sooner
-const float BOOST_MAX = 110.0f;       // Your tested value (90 + 110 = 200)
-const float BOOST_RAMP_UP = 400.0f;   // CHANGED from 250: 0 -> 150 in ~0.4 s
-const float BOOST_DECAY = 150.0f;     // Your tested value: boost fades in gentle curves
-const float BRAKE_MIN_BOOST = 40.0f;  // CHANGED from 20: brake only after real speed-up (no pulsing)
-const uint32_t BRAKE_MS = 100;        // CHANGED from 60: brake time at FULL boost (scales down with less boost)
-const float BRAKE_PWM = 70.0f;        // ADDED: REAL brake. Both wheels pushed backward this much (plus steering)
-const float STRAIGHT_FILTER = 0.1f;   // ADDED: smoothing of |error| for the straight test (~60 ms average)
-// ADDED: a curve must be seen this many readings IN A ROW (6 ms each) before
-// the boost is cut and the car brakes. One noisy spike on a straight no longer
-// triggers the brake. 3 readings = 18 ms (~3-4 cm at full boost).
-const uint8_t CURVE_CONFIRM_READS = 2; // CHANGED from 3: cut after 12 ms instead of 18 ms
+const float STRAIGHT_ERROR = 0.8f;    // |error| below this = straight: ramp up
+const float BOOST_DROP_ERROR = 1.5f;  // |error| above this = curve: cut boost to 0 at once
+const float BOOST_MAX = 150.0f;        // Extra PWM on long straights (90 + 60 = 150)
+const float BOOST_RAMP_UP = 150.0f;   // PWM gained per second (0 -> 60 in 0.4 s)
+const float BOOST_DECAY = 300.0f;     // PWM lost per second between the two thresholds
+const float BRAKE_MIN_BOOST = 20.0f;  // Only brake if boost was at least this high
+const uint32_t BRAKE_MS = 60;         // Brake time: forward speed 0, steering still active       // CHANGED from 120: must be >= MAX_TURN
 const float SIDE_MEMORY_ERROR = 1.0f;  // ADDED: |error| needed to remember which side the line is on // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
 const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course needs it.
 const int MIN_LINE_PEAK = 220;       // Normalized 0..1000. Initial guess.
 const int MIN_LINE_SUM = 300;
-const int BAR_DARK_LEVEL = 600; //DANGER DANGER should be 650
+const int BAR_DARK_LEVEL = 550; //DANGER DANGER should be 650, then 600,
 const uint8_t BAR_SENSOR_COUNT = 8;   // All eight sensors must see black.
 const uint8_t BAR_CONFIRM_READS = 2;  // Reject a one-sample all-black glitch.
 const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
@@ -116,8 +109,6 @@ uint8_t barsSeen = 0;                 // ADDED: 0 = going out, 1 = coming back
 uint32_t turnStartMs = 0;
 float integral = 0.0f;
 float boost = 0.0f;                   // ADDED: current straight-line boost
-float smoothAbsError = 7.0f;          // ADDED: averaged |error|; starts high = not straight
-uint8_t curveReads = 0;               // ADDED: consecutive readings above BOOST_DROP_ERROR
 uint32_t brakeUntilMs = 0;            // ADDED: braking until this time
 bool sharpMode = false;               // ADDED: true while pivoting through a sharp corner
 int lastSide = 0;                     // ADDED: +1 / -1 = side the line was last clearly seen on
@@ -266,7 +257,6 @@ void loop() {
       lastSide = 0;
       sharpMode = false;
       boost = 0.0f;
-      smoothAbsError = 7.0f;
       lastTurn = 0.0f;
       lastSampleUs = micros();
       state = TRACKING;
@@ -282,7 +272,7 @@ void loop() {
   nowMs = millis();
   
 
-  digitalWrite(STATUS_LED, boost > 10.0f ? HIGH : LOW);   // CHANGED: LED ON = boost active
+  digitalWrite(STATUS_LED, HIGH);
 
   int sum = 0, peak = 0, weighted = 0;
   uint8_t darkSensors = 0;
@@ -321,7 +311,6 @@ void loop() {
     }
     lastSeenMs = nowMs;
     boost = 0.0f;                      // ADDED: no boost over a bar
-    smoothAbsError = 7.0f;
     drive(lastTurn, BASE_PWM);
     return;
   }
@@ -329,7 +318,6 @@ void loop() {
 
   if (!lineSeen) {
     boost = 0.0f;                      // ADDED: lost line = no boost
-    smoothAbsError = 7.0f;
     clearReads = 0;
     derivativeReady = false;
     filteredDelta = 0.0f;
@@ -370,7 +358,6 @@ void loop() {
   }
   if (sharpMode) {
     boost = 0.0f;                      // ADDED: no boost while pivoting
-    smoothAbsError = 7.0f;
     const float side = error > 0.0f ? 1.0f : -1.0f;
     lastTurn = STEERING_SIGN * side * MAX_TURN;   // recovery & bar logic stay consistent
     previousError = error;
@@ -414,30 +401,18 @@ void loop() {
 
   // ADDED: straight-line boost with fast cut and brake before curves.
   const float absError = fabsf(error);
-  // CHANGED: decide "straight" from the SMOOTHED error, so a wobbling car on a
-  // straight still gets the boost. The curve cut still uses the RAW error.
-  smoothAbsError += STRAIGHT_FILTER * (absError - smoothAbsError);
-  // CHANGED: count consecutive high-error readings; cut + brake only when confirmed.
-  if (absError > BOOST_DROP_ERROR) {
-    if (curveReads < 255) ++curveReads;
-  } else {
-    curveReads = 0;
-  }
-  if (curveReads >= CURVE_CONFIRM_READS) {
-    // CHANGED: brake time scales with how fast the car was going.
-    if (boost >= BRAKE_MIN_BOOST) brakeUntilMs = nowMs + (uint32_t)(BRAKE_MS * boost / BOOST_MAX);
-    boost = 0.0f;                                   // confirmed curve: cut
-  } else if (absError > BOOST_DROP_ERROR) {
-    // not confirmed yet: hold the boost (don't add, don't cut)
-  } else if (smoothAbsError < STRAIGHT_ERROR) {
+  if (absError < STRAIGHT_ERROR) {
     boost += BOOST_RAMP_UP * dt;                    // straight: speed up
+  } else if (absError > BOOST_DROP_ERROR) {
+    if (boost >= BRAKE_MIN_BOOST) brakeUntilMs = nowMs + BRAKE_MS;  // was fast: brake
+    boost = 0.0f;                                   // curve coming: cut at once
   } else {
-    boost -= BOOST_DECAY * dt;                      // in between: hold (DECAY = 0)
+    boost -= BOOST_DECAY * dt;                      // in between: ease off fast
   }
   boost = limitFloat(boost, 0.0f, BOOST_MAX);
 
   if (nowMs < brakeUntilMs) {
-    drive(lastTurn, -BRAKE_PWM);   // CHANGED: real brake (wheels push backward), still steering into the curve
+    drive(lastTurn, 0.0f);    // brake: no forward drive, keep steering into the curve
   } else {
     drive(lastTurn, base + boost);
   }
