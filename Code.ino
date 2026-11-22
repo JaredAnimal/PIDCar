@@ -51,18 +51,19 @@ const float SHARP_GAIN = 4.0f;
 // ADDED: STRAIGHT-LINE BOOST. On straights (small error) speed ramps up
 // quickly; the moment the error grows (a curve is coming) the boost is cut
 // to zero and the car briefly brakes before the curve.
-const float STRAIGHT_ERROR = 1.2f;    // CHANGED from 0.8 (uses SMOOTHED error): wobble no longer blocks the boost
-const float BOOST_DROP_ERROR = 3.0f;  // CHANGED from 2.5: raw |error| above this (CONFIRMED) = curve: cut boost
-const float BOOST_MAX = 150.0f;       // Extra PWM on long straights (90 + 150 = 240). Kept your value.
+const float STRAIGHT_ERROR = 0.8f;    // Your tested value (smoothed error)
+const float BOOST_DROP_ERROR = 2.0f;  // CHANGED from 3.0: see a sharp curve coming sooner
+const float BOOST_MAX = 110.0f;       // Your tested value (90 + 110 = 200)
 const float BOOST_RAMP_UP = 400.0f;   // CHANGED from 250: 0 -> 150 in ~0.4 s
-const float BOOST_DECAY = 0.0f;       // CHANGED from 300: HOLD the boost between thresholds (decay was killing it)
+const float BOOST_DECAY = 150.0f;     // Your tested value: boost fades in gentle curves
 const float BRAKE_MIN_BOOST = 40.0f;  // CHANGED from 20: brake only after real speed-up (no pulsing)
-const uint32_t BRAKE_MS = 60;         // Brake time: forward speed 0, steering still active
+const uint32_t BRAKE_MS = 100;        // CHANGED from 60: brake time at FULL boost (scales down with less boost)
+const float BRAKE_PWM = 70.0f;        // ADDED: REAL brake. Both wheels pushed backward this much (plus steering)
 const float STRAIGHT_FILTER = 0.1f;   // ADDED: smoothing of |error| for the straight test (~60 ms average)
 // ADDED: a curve must be seen this many readings IN A ROW (6 ms each) before
 // the boost is cut and the car brakes. One noisy spike on a straight no longer
 // triggers the brake. 3 readings = 18 ms (~3-4 cm at full boost).
-const uint8_t CURVE_CONFIRM_READS = 3;
+const uint8_t CURVE_CONFIRM_READS = 2; // CHANGED from 3: cut after 12 ms instead of 18 ms
 const float SIDE_MEMORY_ERROR = 1.0f;  // ADDED: |error| needed to remember which side the line is on // Never slow below this in a curve.    // Change only if verified steering is reversed.
 const uint32_t SAMPLE_US = 6000;
 const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
@@ -423,7 +424,8 @@ void loop() {
     curveReads = 0;
   }
   if (curveReads >= CURVE_CONFIRM_READS) {
-    if (boost >= BRAKE_MIN_BOOST) brakeUntilMs = nowMs + BRAKE_MS;  // was fast: brake
+    // CHANGED: brake time scales with how fast the car was going.
+    if (boost >= BRAKE_MIN_BOOST) brakeUntilMs = nowMs + (uint32_t)(BRAKE_MS * boost / BOOST_MAX);
     boost = 0.0f;                                   // confirmed curve: cut
   } else if (absError > BOOST_DROP_ERROR) {
     // not confirmed yet: hold the boost (don't add, don't cut)
@@ -435,7 +437,7 @@ void loop() {
   boost = limitFloat(boost, 0.0f, BOOST_MAX);
 
   if (nowMs < brakeUntilMs) {
-    drive(lastTurn, 0.0f);    // brake: no forward drive, keep steering into the curve
+    drive(lastTurn, -BRAKE_PWM);   // CHANGED: real brake (wheels push backward), still steering into the curve
   } else {
     drive(lastTurn, base + boost);
   }
