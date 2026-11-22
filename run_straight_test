@@ -1,0 +1,104 @@
+// ECE3 MOTOR MATCH TEST
+// Drives both motors straight at full PWM (255) with NO line following and
+// NO trim, then stops and reports the encoder counts of each wheel.
+//
+// How to use:
+//   1. Upload. Put the car on a long, clear, flat floor (not the track).
+//   2. Reset the board. After a 2 second countdown (slow LED blink), the car
+//      drives at 255 for RUN_MS, then stops.
+//   3. Watch which way it curves: it curves AWAY from the faster motor
+//      (faster left wheel -> car curves right).
+//   4. Open the Serial Monitor at 9600 baud. The results print every second
+//      after the run, so you can plug in the cable afterwards.
+//   5. Run it 3 times and use the average trim.
+#include <Arduino.h>
+#include <ECE3.h>
+
+const uint8_t LEFT_SLEEP = 31, LEFT_DIR = 29, LEFT_PWM = 40;
+const uint8_t RIGHT_SLEEP = 11, RIGHT_DIR = 30, RIGHT_PWM = 39;
+const uint8_t STATUS_LED = 41;
+
+const int TEST_PWM = 255;            // Full speed on both motors, no trim.
+const uint32_t START_DELAY_MS = 2000;
+const uint32_t RUN_MS = 1500;        // How long to drive. Lower it if your floor is short.
+
+long leftCount = 0, rightCount = 0;
+
+void stopMotors() {
+  analogWrite(LEFT_PWM, 0);
+  analogWrite(RIGHT_PWM, 0);
+  digitalWrite(LEFT_SLEEP, LOW);
+  digitalWrite(RIGHT_SLEEP, LOW);
+}
+
+void setup() {
+  pinMode(LEFT_SLEEP, OUTPUT);
+  pinMode(LEFT_DIR, OUTPUT);
+  pinMode(LEFT_PWM, OUTPUT);
+  pinMode(RIGHT_SLEEP, OUTPUT);
+  pinMode(RIGHT_DIR, OUTPUT);
+  pinMode(RIGHT_PWM, OUTPUT);
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(LEFT_DIR, LOW);       // LOW = forward on stock RSLK
+  digitalWrite(RIGHT_DIR, LOW);
+  stopMotors();
+
+  ECE3_Init();
+  Serial.begin(9600);
+
+  // 2 second countdown with slow LED blink.
+  uint32_t t0 = millis();
+  while (millis() - t0 < START_DELAY_MS) {
+    digitalWrite(STATUS_LED, ((millis() - t0) / 250) % 2);
+  }
+
+  // Drive straight at full speed.
+  resetEncoderCount_left();
+  resetEncoderCount_right();
+  digitalWrite(STATUS_LED, HIGH);
+  digitalWrite(LEFT_SLEEP, HIGH);
+  digitalWrite(RIGHT_SLEEP, HIGH);
+  analogWrite(LEFT_PWM, TEST_PWM);
+  analogWrite(RIGHT_PWM, TEST_PWM);
+  delay(RUN_MS);
+  stopMotors();
+  delay(300);                        // let the wheels stop before reading
+
+  leftCount = getEncoderCount_left();
+  rightCount = getEncoderCount_right();
+  if (leftCount < 0) leftCount = -leftCount;
+  if (rightCount < 0) rightCount = -rightCount;
+  digitalWrite(STATUS_LED, LOW);
+}
+
+void loop() {
+  // Print the result once a second, forever.
+  Serial.println("---- MOTOR TEST (PWM 255, no trim) ----");
+  Serial.print("Left  encoder count: ");
+  Serial.println(leftCount);
+  Serial.print("Right encoder count: ");
+  Serial.println(rightCount);
+
+  if (leftCount > 0 && rightCount > 0) {
+    float diff = 100.0f * (leftCount - rightCount) / (float)rightCount;
+    Serial.print("Left is ");
+    Serial.print(diff, 1);
+    Serial.println("% vs right (+ = left faster
+    )");
+
+    // Trim for the FASTER motor = slower / faster. The other trim stays 1.0.
+    if (leftCount > rightCount) {
+      Serial.print("Suggested: LEFT_TRIM = ");
+      Serial.print((float)rightCount / leftCount, 3);
+      Serial.println(";  RIGHT_TRIM = 1.0;");
+    } else {
+      Serial.print("Suggested: LEFT_TRIM = 1.0;  RIGHT_TRIM = ");
+      Serial.print((float)leftCount / rightCount, 3);
+      Serial.println(";");
+    }
+  } else {
+    Serial.println("An encoder read 0: check encoder wiring / ECE3 library.");
+  }
+  Serial.println();
+  delay(1000);
+}
