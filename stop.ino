@@ -1,6 +1,6 @@
 // ECE3 line follower (PID): turn at the first confirmed bar and stop at the second.
 // PID rewrite: Kd/Kp = 15, stronger bounded integral, no sharp-corner override.
-// STOP FIX: 6-of-8 bar, tilt-tolerant bar detection, bar backup check, slow-down + failsafe near the finish.
+// TILT FIX: bar also detected when the car crosses it at an angle.
 // Starts automatically after a two-second countdown. Reset for another run.
 // Gains and thresholds need track testing.
 #include <Arduino.h>
@@ -54,20 +54,14 @@ const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course ne
 const int MIN_LINE_PEAK = 220;       // Normalized 0..1000. Initial guess.
 const int MIN_LINE_SUM = 300;
 const int BAR_DARK_LEVEL = 550; //DANGER DANGER should be 650, then 600,
-const uint8_t BAR_SENSOR_COUNT = 6;   // STOP FIX: was 8. 6 of 8 dark = bar.
+const uint8_t BAR_SENSOR_COUNT = 8;   // All eight sensors must see black.
 const uint8_t BAR_CONFIRM_READS = 2;  // Reject a one-sample all-black glitch.
-const uint32_t BAR_GAP_MS = 30;       // STOP FIX: bar readings may have short gaps (wiggle) and still count.
-const uint32_t BAR_BACKUP_MS = 80;    // STOP FIX: line lost this soon after a bar-like reading = it WAS the bar.
-// STOP FIX (tilt): a tilted car crosses the bar at an angle, so the sensors hit
-// it one after another. Each sensor "remembers" seeing black for BAR_WINDOW_MS.
-// If enough different sensors (including BOTH outer ones) saw black within that
-// window, it is the bar. A curve only reaches one side, so it can't trigger this.
-const uint32_t BAR_WINDOW_MS = 60;    // try 40..100 (longer = more tilt allowed)
+// TILT FIX: a tilted car crosses the bar at an angle, so the sensors hit it one
+// after another. Each sensor "remembers" seeing black for BAR_WINDOW_MS. If
+// enough different sensors (including BOTH outer ones) saw black within that
+// window, it is the bar.
+const uint32_t BAR_WINDOW_MS = 90;    // CHANGED from 60: allows more tilt. Try 40..120.
 const uint8_t BAR_WINDOW_SENSORS = 6; // sensors that must have seen black in the window
-// STOP FIX: the way back is as long as the way out. Measured with the encoders.
-const float FINISH_SLOW_FRACTION = 0.92f;     // after 92% of the outbound distance: slow down
-const float FINISH_SLOW_PWM = 70.0f;          // max speed near the finish (bar is easy to see)
-const float FINISH_FAILSAFE_FRACTION = 1.06f; // after 106%: stop anyway (bar was missed)
 const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
 
 // ADDED: 180-degree turnaround at the FIRST bar, stop at the SECOND bar.
@@ -109,9 +103,7 @@ uint8_t clearReads = 0, barReads = 0;
 float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
 uint8_t barsSeen = 0;                 // ADDED: 0 = going out, 1 = coming back
 uint32_t turnStartMs = 0;
-uint32_t lastBarMs = 0, wideSeenMs = 0;  // STOP FIX
-uint32_t sensorDarkMs[8] = {0};          // STOP FIX: last time each sensor saw black
-long outboundCounts = 0;                 // STOP FIX: encoder distance from start to the T-bar
+uint32_t sensorDarkMs[8] = {0};          // TILT FIX: last time each sensor saw black
 float integral = 0.0f;
 float boost = 0.0f;                   // ADDED: current straight-line boost
 uint32_t brakeUntilMs = 0;            // ADDED: braking until this time
@@ -162,7 +154,6 @@ void resetEncoders() {
 
 // ADDED: start spinning in place (left wheel back, right wheel forward).
 void startTurn(uint32_t nowMs) {
-  outboundCounts = encoderAverage();   // STOP FIX: remember how far the T-bar was
   resetEncoders();
   setWheel(LEFT_DIR, LEFT_PWM, -TURN_PWM * LEFT_TRIM);     // CHANGED: trim here too
   setWheel(RIGHT_DIR, RIGHT_PWM, TURN_PWM * RIGHT_TRIM);
@@ -171,9 +162,6 @@ void startTurn(uint32_t nowMs) {
   turnStartMs = nowMs;
   state = TURNING;
 }
-
-// STOP FIX: first bar = turn around, second bar = stop.
-void handleBar(uint32_t nowMs);
 
 void stopRun(bool success) {
   stopMotors();
@@ -236,7 +224,6 @@ void loop() {
     if (nowMs - startMs < START_DELAY_MS) return;   // CHANGED: was 1000
     state = TRACKING;
     startMs = lastSeenMs = nowMs;
-    resetEncoders();                    // STOP FIX: measure distance from the start
     lastSampleUs = micros();
     return;
   }
@@ -266,7 +253,7 @@ void loop() {
       lastSide = 0;
       boost = 0.0f;
       lastTurn = 0.0f;
-      for (uint8_t i = 0; i < 8; ++i) sensorDarkMs[i] = 0;   // STOP FIX
+      for (uint8_t i = 0; i < 8; ++i) sensorDarkMs[i] = 0;   // TILT FIX: forget the T-bar
       lastSampleUs = micros();
       state = TRACKING;
     }
@@ -296,14 +283,14 @@ void loop() {
     if (value > peak) peak = value;
     if (value >= BAR_DARK_LEVEL) {
       ++darkSensors;
-      sensorDarkMs[i] = nowMs;           // STOP FIX: remember it
+      sensorDarkMs[i] = nowMs;           // TILT FIX: remember it
     }
   }
 
   const bool lineSeen = peak >= MIN_LINE_PEAK && sum >= MIN_LINE_SUM;
 
-  // STOP FIX (tilt): many different sensors, incl. both outer ones, saw black
-  // within the last BAR_WINDOW_MS = bar crossed at an angle.
+  // TILT FIX: many different sensors, incl. both outer ones, saw black within
+  // the last BAR_WINDOW_MS = bar crossed at an angle.
   if (finishArmed && STOP_AT_BAR && nowMs > BAR_WINDOW_MS) {
     uint8_t recent = 0;
     for (uint8_t i = 0; i < 8; ++i) {
@@ -313,16 +300,14 @@ void loop() {
                            (nowMs - sensorDarkMs[7] < BAR_WINDOW_MS);
     if (recent >= BAR_WINDOW_SENSORS && bothEdges) {
       for (uint8_t i = 0; i < 8; ++i) sensorDarkMs[i] = 0;   // don't re-trigger
-      handleBar(nowMs);
+      if (barsSeen == 0) {               // first bar = turn around
+        barsSeen = 1;
+        startTurn(nowMs);
+      } else {                           // second bar = stop
+        stopRun(true);
+      }
       return;
     }
-  }
-
-  // STOP FIX: remember bar-like readings (most sensors dark INCLUDING both outer ones).
-  {
-    const int v0 = (int32_t(raw[0]) - SENSOR_MIN[0]) * 1000L / (SENSOR_MAX[0] - SENSOR_MIN[0]);
-    const int v7 = (int32_t(raw[7]) - SENSOR_MIN[7]) * 1000L / (SENSOR_MAX[7] - SENSOR_MIN[7]);
-    if (darkSensors >= 6 && v0 >= BAR_DARK_LEVEL && v7 >= BAR_DARK_LEVEL) wideSeenMs = nowMs;
   }
   // Require all eight normalized sensors to see black at once.
   const bool crosspiece = darkSensors >= BAR_SENSOR_COUNT;
@@ -332,12 +317,15 @@ void loop() {
     filteredDelta = 0.0f;
     integral = 0.0f;                   // ADDED (PID)
     // A lone all-dark glitch must not produce a steering spike or a finish.
-    // STOP FIX: readings count even with short gaps between them.
-    if (nowMs - lastBarMs > BAR_GAP_MS) barReads = 0;
-    lastBarMs = nowMs;
     if (finishArmed && STOP_AT_BAR) {
       if (++barReads >= BAR_CONFIRM_READS) {
-        handleBar(nowMs);
+        // CHANGED: first bar = turn around, second bar = stop.
+        if (barsSeen == 0) {
+          barsSeen = 1;
+          startTurn(nowMs);
+        } else {
+          stopRun(true);
+        }
         return;
       }
     }
@@ -346,13 +334,9 @@ void loop() {
     drive(lastTurn, BASE_PWM);
     return;
   }
+  barReads = 0; // Confirmation must be consecutive.
 
   if (!lineSeen) {
-    // STOP FIX: line ended right after a bar-like reading = we crossed the bar.
-    if (finishArmed && STOP_AT_BAR && nowMs - wideSeenMs < BAR_BACKUP_MS) {
-      handleBar(nowMs);
-      return;
-    }
     integral = 0.0f; // Clear stored correction before reacquiring the line.
     boost = 0.0f;                      // ADDED: lost line = no boost
     clearReads = 0;
@@ -379,17 +363,6 @@ void loop() {
   // so the car can't re-trigger on the bar it just turned on.
   if (!finishArmed && ++clearReads >= CLEAR_READS_TO_ARM &&
       (barsSeen == 0 || encoderAverage() >= REARM_COUNTS)) finishArmed = true;
-  // STOP FIX: return-trip distance checks.
-  float speedCap = 255.0f;
-  if (barsSeen == 1 && outboundCounts > 0 && STOP_AT_BAR) {
-    const long back = encoderAverage();
-    if (back >= (long)(FINISH_FAILSAFE_FRACTION * outboundCounts)) {
-      stopRun(true);                    // missed the finish bar: stop anyway
-      return;
-    }
-    if (back >= (long)(FINISH_SLOW_FRACTION * outboundCounts)) speedCap = FINISH_SLOW_PWM;
-  }
-
   const float error = float(weighted) / float(sum) - CENTER_OFFSET;
   // ADDED: remember the side only when clearly off-center, so noise near
   // the middle can't change it.
@@ -443,15 +416,6 @@ void loop() {
   if (nowMs < brakeUntilMs) {
     drive(lastTurn, 0.0f);    // brake: no forward drive, keep steering into the curve
   } else {
-    drive(lastTurn, fminf(base + boost, speedCap));   // STOP FIX: slow near the finish
-  }
-}
-
-void handleBar(uint32_t nowMs) {
-  if (barsSeen == 0) {
-    barsSeen = 1;
-    startTurn(nowMs);
-  } else {
-    stopRun(true);
+    drive(lastTurn, base + boost);
   }
 }
