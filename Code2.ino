@@ -1,184 +1,249 @@
-// ECE3 line follower - ZONE STEERING (aggressive, abrupt corrections).
-// The line position picks one of 4 zones; each zone applies a FIXED turn and
-// speed immediately. Small fast flicks on straights, hard turns in curves.
-// Turns around at the first T-bar, stops at the second.
-// Starts automatically after a 2 second countdown. Reset for another run.
+// ECE3 line follower (PID): turn at the first confirmed bar and stop at the second.
+// PID rewrite: Kd/Kp = 15, stronger bounded integral, no sharp-corner override.
+// Starts automatically after a two-second countdown. Reset for another run.
+// Gains and thresholds need track testing.
 #include <Arduino.h>
 #include <ECE3.h>
 #include <math.h>
 
-// ---------------- Pins ----------------
 const uint8_t LEFT_SLEEP = 31, LEFT_DIR = 29, LEFT_PWM = 40;
 const uint8_t RIGHT_SLEEP = 11, RIGHT_DIR = 30, RIGHT_PWM = 39;
+const uint8_t START_BUTTON = 73, STOP_BUTTON = 74;
 const uint8_t STATUS_LED = 41;
 
-// ---------------- Zones (main tuning) ----------------
-// |error| limits, sensor units (max ~7):
-const float ZONE0 = 0.3f;             // below: centered -> go straight
-const float ZONE1 = 1.5f;             // below: slightly off -> small flick
-const float ZONE2 = 3.0f;             // below: curve -> medium turn; above: hard turn
-// Turn in each zone (PWM added to the outer wheel, taken from the inner one):
-const float ZONE_TURN1 = 30.0f;       // small flick (straights)
-const float ZONE_TURN2 = 65.0f;       // medium turn (curves)
-const float ZONE_TURN3 = 110.0f;      // hard turn (sharp curves)
-// Forward speed in each zone (PWM 0..255):
-const float ZONE_SPEED0 = 130.0f;     // centered
-const float ZONE_SPEED1 = 120.0f;     // small flick
-const float ZONE_SPEED2 = 90.0f;      // curve
-const float ZONE_SPEED3 = 55.0f;      // sharp curve
+// First parameters to tune. PWM uses 0..255, not percent.
+const float BASE_PWM = 100.0f;   // CHANGED from 45: your tested speed
+const float STEERING_ERROR_PERCENT = 160.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
+const float KD_TO_KP_RATIO = 12.0f; // D uses error change per nominal 6 ms.
+// ADDED (PID): integral term. It builds up while the car stays on one side of
+// the line (a long or sharp curve), adding extra turn the longer the curve lasts.
+const float KI_TO_KP_RATIO = 4.0f; // Integral accumulation uses seconds.
+const float INTEGRAL_MAX_TURN = 60.0f; // Maximum integral contribution in PWM.
+const float INTEGRAL_DEADBAND = 80.0f;      // CHANGED from 300: now also removes a steady offset on straights.
+const float CENTER_OFFSET = -0.0565749235f;  // New-car calibration with existing POSITION weights and integer normalization.
+const float STEERING_SIGN = 1.0f;
+// ADDED: motor trim. If the car drifts to one side on a straight, lower the
+// stronger side slightly (e.g. 0.95). 1.0 = no change.
+const float LEFT_TRIM = 1.0f; // Equal motors on the new car.
+const float RIGHT_TRIM = 1.0f;
+// ADDED for sharp turns:
+const float MAX_TURN = 120.0f;    // CHANGED from 70: at base 90, 70 could not slow the inner wheel below 20
+const float CURVE_SLOW = 3.0f;    // CHANGED from 2: at base 90 the car barely slowed in curves (T9)
+const float MIN_BASE_PWM = 60.0f; // CHANGED from 25: low PWM = low torque, sluggish turning
+const float RECOVERY_BASE_PWM = 0.0f;  // CHANGED from 10: pure pivot when the line is lost
 
-// Line lost: pivot in place toward the side the line was last seen on.
-const float RECOVERY_TURN = 90.0f;
-const float SIDE_MEMORY_ERROR = 1.0f; // |error| needed to remember the side
+// Fixed recovery is used only when the sensors lose the line.
+const float RECOVERY_TURN = 120.0f;
+const float TURN_LIMIT = 150.0f;
 
-// ---------------- Car setup ----------------
-const float STEERING_SIGN = 1.0f;     // -1 if the car steers away from the line
-const uint32_t SAMPLE_US = 6000;      // Sensor read / steering update every 6 ms
-const uint32_t START_DELAY_MS = 2000;
+// ADDED: STRAIGHT-LINE BOOST. On straights (small error) speed ramps up
+// quickly; the moment the error grows (a curve is coming) the boost is cut
+// to zero and the car briefly brakes before the curve.
+const float STRAIGHT_ERROR = 0.8f;    // |error| below this = straight: ramp up
+const float BOOST_DROP_ERROR = 1.5f;  // |error| above this = curve: cut boost to 0 at once
+const float BOOST_MAX = 0.0f;        // Extra PWM on long straights (90 + 60 = 150)
+const float BOOST_RAMP_UP = 150.0f;   // PWM gained per second (0 -> 60 in 0.4 s)
+const float BOOST_DECAY = 300.0f;     // PWM lost per second between the two thresholds
+const float BRAKE_MIN_BOOST = 20.0f;  // Only brake if boost was at least this high
+const uint32_t BRAKE_MS = 60;         // Brake time: forward speed 0, steering still active       // CHANGED from 120: must be >= MAX_TURN
+const float SIDE_MEMORY_ERROR = 1.0f;  // ADDED: |error| needed to remember which side the line is on // Never slow below this in a curve.    // Change only if verified steering is reversed.
+const uint32_t SAMPLE_US = 6000;
+const uint32_t LOST_LINE_MS = 150;   // Short dropout allowance, not gap navigation.
+const uint32_t MAX_RUN_MS = 120000;  // Backstop; increase if the slow course needs it.
+const int MIN_LINE_PEAK = 220;       // Normalized 0..1000. Initial guess.
+const int MIN_LINE_SUM = 300;
+const int BAR_DARK_LEVEL = 550; //DANGER DANGER should be 650, then 600,
+const uint8_t BAR_SENSOR_COUNT = 8;   // All eight sensors must see black.
+const uint8_t BAR_CONFIRM_READS = 2;  // Reject a one-sample all-black glitch.
+const bool STOP_AT_BAR = true;        // ADDED: set false to disable stopping entirely (testing only)
 
-// ---------------- Sensors / calibration ----------------
-// Order RIGHT to LEFT, same as the calibration sketch.
+// ADDED: 180-degree turnaround at the FIRST bar, stop at the SECOND bar.
+const int TURN_PWM = 255;             // CHANGED from 60: full speed for the turnaround spin.
+const int TURN_FINISH_PWM = 80;       // ADDED: slower for the last part of the spin, so it stops on target
+const long TURN_SLOWDOWN_COUNTS = 90; // ADDED: switch to TURN_FINISH_PWM this many counts before the end
+const long TURN_COUNTS = 360;         // Encoder counts per wheel for 180 deg. INITIAL GUESS: tune on the floor.
+const uint32_t TURN_TIMEOUT_MS = 1500;// Backstop if the encoders don't count.
+const long REARM_COUNTS = 300;        // Distance to drive after turning before the next bar can count.
+const uint8_t CLEAR_READS_TO_ARM = 10;
+const uint32_t START_DELAY_MS = 2000; // ADDED: wait 2 s after power-on/reset before driving
+
+// S1..S8 in the spreadsheet = raw indices 0..7 in the calibration sketch.
+// The supplied starter identifies that order as RIGHT to LEFT.
+// New-car sensor calibration; sensor order remains RIGHT to LEFT.
 const int SENSOR_MIN[8] = {771, 759, 681, 726, 521, 612, 657, 703};
 const int SENSOR_MAX[8] = {2500, 2500, 2500, 2091, 1909, 2500, 2500, 2500};
 const int POSITION[8] = {-7, -5, -3, -1, 1, 3, 5, 7};
-const float CENTER_OFFSET = -0.0565749235f;
-const int MIN_LINE_PEAK = 220;        // normalized 0..1000
-const int MIN_LINE_SUM = 300;
 
-// ---------------- T-bar ----------------
-const int BAR_DARK_LEVEL = 600;
-const uint8_t BAR_SENSOR_COUNT = 8;   // all eight dark = bar
-const uint8_t BAR_CONFIRM_READS = 2;
-const uint8_t CLEAR_READS_TO_ARM = 10;
-const long REARM_COUNTS = 300;        // distance after the turnaround before the next bar counts
-const uint32_t BAR_BACKUP_MS = 80;    // line lost within this time after a bar-like reading = bar
+// Scale PD to a maximum absolute error of 2000 for the professor's gain rule.
+// POSITION is ordered, so its endpoints bound every possible centroid.
+// Curve slowing and recovery continue to use the original centroid units.
+const float MAX_CENTROID_ERROR =
+    fmaxf(fabsf(float(POSITION[0]) - CENTER_OFFSET),
+          fabsf(float(POSITION[7]) - CENTER_OFFSET));
+const float PD_ERROR_SCALE = 2000.0f / MAX_CENTROID_ERROR;
+const float KP = (STEERING_ERROR_PERCENT / 100.0f) * BASE_PWM / 2000.0f;
+const float KD = KD_TO_KP_RATIO * KP; // Error change per nominal 6 ms.
+const float KI = KI_TO_KP_RATIO * KP; // ADDED (PID): per second of accumulated error.
+const float INTEGRAL_LIMIT = INTEGRAL_MAX_TURN / KI; // Anti-windup clamp.
 
-// ---------------- Turnaround ----------------
-const int TURN_PWM = 255;
-const int TURN_FINISH_PWM = 80;
-const long TURN_SLOWDOWN_COUNTS = 90;
-const long TURN_COUNTS = 360;         // tune on the floor for exactly 180 degrees
-const uint32_t TURN_TIMEOUT_MS = 1500;
-
-// ---------------- State ----------------
-enum RunState { START_DELAY, TRACKING, TURNING, FINISHED };
-RunState state = START_DELAY;
+enum RunState { WAITING, START_DELAY, TRACKING, TURNING, FINISHED, FAULT };
+RunState state = WAITING;
 uint16_t raw[8];
-uint32_t startMs = 0, lastSampleUs = 0, turnStartMs = 0, wideSeenMs = 0;
-bool finishArmed = false;
-uint8_t clearReads = 0, barReads = 0, barsSeen = 0;
-int lastSide = 0;
-float lastTurn = 0.0f;
+uint32_t buttonChangedMs = 0, startMs = 0, lastSeenMs = 0, lastSampleUs = 0;
+bool lastButtonDown = false, startPressSeen = false;
+bool finishArmed = false, derivativeReady = false;
+uint8_t clearReads = 0, barReads = 0;
+float previousError = 0.0f, filteredDelta = 0.0f, lastTurn = 0.0f;
+uint8_t barsSeen = 0;                 // ADDED: 0 = going out, 1 = coming back
+uint32_t turnStartMs = 0;
+float integral = 0.0f;
+float boost = 0.0f;                   // ADDED: current straight-line boost
+uint32_t brakeUntilMs = 0;            // ADDED: braking until this time
+int lastSide = 0;                     // ADDED: +1 / -1 = side the line was last clearly seen on
 
-// ---------------- Motors ----------------
-void setWheel(uint8_t dirPin, uint8_t pwmPin, float cmd) {
-  digitalWrite(dirPin, cmd < 0.0f ? HIGH : LOW);   // LOW = forward
-  int pwm = (int)fabsf(cmd);
-  if (pwm > 255) pwm = 255;
-  analogWrite(pwmPin, pwm);
-}
-
-void drive(float turn, float speed) {
-  // Positive turn: slow the left wheel, speed up the right.
-  setWheel(LEFT_DIR, LEFT_PWM, speed - turn);
-  setWheel(RIGHT_DIR, RIGHT_PWM, speed + turn);
-  digitalWrite(LEFT_SLEEP, HIGH);
-  digitalWrite(RIGHT_SLEEP, HIGH);
+float limitFloat(float value, float low, float high) {
+  return value < low ? low : (value > high ? high : value);
 }
 
 void stopMotors() {
   analogWrite(LEFT_PWM, 0);
   analogWrite(RIGHT_PWM, 0);
-  digitalWrite(LEFT_DIR, LOW);
+  digitalWrite(LEFT_DIR, LOW);   // back to forward
   digitalWrite(RIGHT_DIR, LOW);
   digitalWrite(LEFT_SLEEP, LOW);
   digitalWrite(RIGHT_SLEEP, LOW);
 }
 
+// CHANGED: one wheel command; negative = run that wheel backward.
+void setWheel(uint8_t dirPin, uint8_t pwmPin, float cmd) {
+  digitalWrite(dirPin, cmd < 0.0f ? HIGH : LOW); // LOW = forward on stock RSLK
+  int pwm = (int)fabsf(cmd);
+  if (pwm > 255) pwm = 255;
+  analogWrite(pwmPin, pwm);
+}
+
+// CHANGED: takes a base speed, and allows the inner wheel to reverse on sharp turns.
+void drive(float turn, float base) {
+  // Positive error = line to the left: slow the left wheel, speed up the right.
+  turn = limitFloat(turn, -TURN_LIMIT, TURN_LIMIT);   // CHANGED: PID still limited to MAX_TURN below
+  setWheel(LEFT_DIR, LEFT_PWM, (base - turn) * LEFT_TRIM);    // CHANGED: trim
+  setWheel(RIGHT_DIR, RIGHT_PWM, (base + turn) * RIGHT_TRIM);
+  digitalWrite(LEFT_SLEEP, HIGH);
+  digitalWrite(RIGHT_SLEEP, HIGH);
+}
+
+// ADDED: encoder helpers (ECE3 library)
 long encoderAverage() {
   long l = getEncoderCount_left(), r = getEncoderCount_right();
   if (l < 0) l = -l;
   if (r < 0) r = -r;
   return (l + r) / 2;
 }
-
 void resetEncoders() {
   resetEncoderCount_left();
   resetEncoderCount_right();
 }
 
-// First bar -> spin 180 degrees. Second bar -> stop.
-void handleBar(uint32_t nowMs) {
-  if (barsSeen == 0) {
-    barsSeen = 1;
-    resetEncoders();
-    setWheel(LEFT_DIR, LEFT_PWM, -TURN_PWM);
-    setWheel(RIGHT_DIR, RIGHT_PWM, TURN_PWM);
-    digitalWrite(LEFT_SLEEP, HIGH);
-    digitalWrite(RIGHT_SLEEP, HIGH);
-    turnStartMs = nowMs;
-    state = TURNING;
-  } else {
-    stopMotors();
-    state = FINISHED;
-  }
+// ADDED: start spinning in place (left wheel back, right wheel forward).
+void startTurn(uint32_t nowMs) {
+  resetEncoders();
+  setWheel(LEFT_DIR, LEFT_PWM, -TURN_PWM * LEFT_TRIM);     // CHANGED: trim here too
+  setWheel(RIGHT_DIR, RIGHT_PWM, TURN_PWM * RIGHT_TRIM);
+  digitalWrite(LEFT_SLEEP, HIGH);
+  digitalWrite(RIGHT_SLEEP, HIGH);
+  turnStartMs = nowMs;
+  state = TURNING;
 }
 
-int normalize(uint8_t i) {
-  int v = (int32_t(raw[i]) - SENSOR_MIN[i]) * 1000L / (SENSOR_MAX[i] - SENSOR_MIN[i]);
-  if (v < 0) v = 0;
-  if (v > 1000) v = 1000;
-  return v;
+void stopRun(bool success) {
+  stopMotors();
+  state = success ? FINISHED : FAULT;
 }
 
-// ---------------- Setup ----------------
 void setup() {
   pinMode(LEFT_SLEEP, OUTPUT);
   pinMode(RIGHT_SLEEP, OUTPUT);
+  digitalWrite(LEFT_SLEEP, LOW);
+  digitalWrite(RIGHT_SLEEP, LOW);
   pinMode(LEFT_DIR, OUTPUT);
   pinMode(RIGHT_DIR, OUTPUT);
   pinMode(LEFT_PWM, OUTPUT);
   pinMode(RIGHT_PWM, OUTPUT);
-  pinMode(STATUS_LED, OUTPUT);
+  // Stock RSLK motor driver: LOW means forward on both sides.
+  digitalWrite(LEFT_DIR, LOW);
+  digitalWrite(RIGHT_DIR, LOW);
   stopMotors();
+  pinMode(START_BUTTON, INPUT_PULLUP);
+  pinMode(STOP_BUTTON, INPUT_PULLUP);
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, LOW);
   ECE3_Init();
-  startMs = millis();
+  stopMotors();
+  state = START_DELAY;   // skip the button wait
+  startMs = millis();    // start the delay timer
 }
 
-// ---------------- Loop ----------------
 void loop() {
   uint32_t nowMs = millis();
 
+  // LED: slow blink ready/countdown, on running/finished, fast blink stopped/fault.
+  if (state == FAULT) {
+    digitalWrite(STATUS_LED, (nowMs / 150) % 2);
+    return;
+  }
   if (state == FINISHED) {
     digitalWrite(STATUS_LED, HIGH);
     return;
   }
-
+  if (state == WAITING) {
+    digitalWrite(STATUS_LED, (nowMs / 500) % 2);
+    const bool down = digitalRead(START_BUTTON) == LOW;
+    if (down != lastButtonDown) {
+      lastButtonDown = down;
+      buttonChangedMs = nowMs;
+    }
+    if (nowMs - buttonChangedMs >= 30) {
+      if (down) startPressSeen = true;
+      else if (startPressSeen) {
+        state = START_DELAY;
+        startMs = nowMs;
+      }
+    }
+    return;
+  }
   if (state == START_DELAY) {
-    digitalWrite(STATUS_LED, (nowMs / 500) % 2);    // slow blink
-    if (nowMs - startMs < START_DELAY_MS) return;
+    digitalWrite(STATUS_LED, (nowMs / 500) % 2);
+    if (nowMs - startMs < START_DELAY_MS) return;   // CHANGED: was 1000
     state = TRACKING;
+    startMs = lastSeenMs = nowMs;
     lastSampleUs = micros();
     return;
   }
 
+  // ADDED: turnaround in progress. Non-blocking: check encoders each loop.
   if (state == TURNING) {
-    digitalWrite(STATUS_LED, (nowMs / 100) % 2);    // fast blink
+    digitalWrite(STATUS_LED, (nowMs / 100) % 2);
+    // ADDED: full speed for most of the spin, then slow down near the end
+    // so momentum doesn't carry the car past 180 degrees.
     const long turned = encoderAverage();
-    if (turned >= TURN_COUNTS - TURN_SLOWDOWN_COUNTS) {   // slow down near the end
-      setWheel(LEFT_DIR, LEFT_PWM, -TURN_FINISH_PWM);
-      setWheel(RIGHT_DIR, RIGHT_PWM, TURN_FINISH_PWM);
+    if (turned >= TURN_COUNTS - TURN_SLOWDOWN_COUNTS) {
+      setWheel(LEFT_DIR, LEFT_PWM, -TURN_FINISH_PWM * LEFT_TRIM);
+      setWheel(RIGHT_DIR, RIGHT_PWM, TURN_FINISH_PWM * RIGHT_TRIM);
     }
     if (turned >= TURN_COUNTS || nowMs - turnStartMs >= TURN_TIMEOUT_MS) {
       analogWrite(LEFT_PWM, 0);
       analogWrite(RIGHT_PWM, 0);
-      digitalWrite(LEFT_DIR, LOW);
+      digitalWrite(LEFT_DIR, LOW);     // both forward again
       digitalWrite(RIGHT_DIR, LOW);
-      delay(50);
-      resetEncoders();
+      delay(100);                      // brief settle so the car doesn't lurch
+      resetEncoders();                 // measure distance driven since the turn
       finishArmed = false;
       clearReads = barReads = 0;
+      derivativeReady = false;
+      filteredDelta = 0.0f;
+      integral = 0.0f;                 // ADDED (PID)
       lastSide = 0;
+      boost = 0.0f;
       lastTurn = 0.0f;
       lastSampleUs = micros();
       state = TRACKING;
@@ -186,72 +251,138 @@ void loop() {
     return;
   }
 
-  // ---- TRACKING: one update every SAMPLE_US ----
   const uint32_t nowUs = micros();
-  if (nowUs - lastSampleUs < SAMPLE_US) return;
+  const uint32_t elapsedUs = nowUs - lastSampleUs;
+  if (elapsedUs < SAMPLE_US) return;  // No delay() and no catch-up bursts.
   lastSampleUs = nowUs;
   ECE3_read_IR(raw);
   nowMs = millis();
+  
+
   digitalWrite(STATUS_LED, HIGH);
 
   int sum = 0, peak = 0, weighted = 0;
   uint8_t darkSensors = 0;
   for (uint8_t i = 0; i < 8; ++i) {
-    const int v = normalize(i);
-    sum += v;
-    weighted += POSITION[i] * v;
-    if (v > peak) peak = v;
-    if (v >= BAR_DARK_LEVEL) ++darkSensors;
+    // Signed, wide arithmetic prevents underflow and early integer truncation.
+    int value = (int32_t(raw[i]) - SENSOR_MIN[i]) * 1000L /
+                (SENSOR_MAX[i] - SENSOR_MIN[i]);
+    if (value < 0) value = 0;
+    if (value > 1000) value = 1000;
+    sum += value;
+    weighted += POSITION[i] * value;
+    if (value > peak) peak = value;
+    if (value >= BAR_DARK_LEVEL) ++darkSensors;
   }
 
-  // Bar-like reading: most sensors dark INCLUDING both outer ones.
-  if (darkSensors >= 6 && normalize(0) >= BAR_DARK_LEVEL && normalize(7) >= BAR_DARK_LEVEL) {
-    wideSeenMs = nowMs;
-  }
-
-  // ---- T-bar ----
-  if (darkSensors >= BAR_SENSOR_COUNT) {
+  const bool lineSeen = peak >= MIN_LINE_PEAK && sum >= MIN_LINE_SUM;
+  // Require all eight normalized sensors to see black at once.
+  const bool crosspiece = darkSensors >= BAR_SENSOR_COUNT;
+  if (crosspiece) {
     clearReads = 0;
-    if (finishArmed && ++barReads >= BAR_CONFIRM_READS) {
-      handleBar(nowMs);
-      return;
+    derivativeReady = false;
+    filteredDelta = 0.0f;
+    integral = 0.0f;                   // ADDED (PID)
+    // A lone all-dark glitch must not produce a steering spike or a finish.
+    if (finishArmed && STOP_AT_BAR) {
+      if (++barReads >= BAR_CONFIRM_READS) {
+        // CHANGED: first bar = turn around, second bar = stop.
+        if (barsSeen == 0) {
+          barsSeen = 1;
+          startTurn(nowMs);
+        } else {
+          stopRun(true);
+        }
+        return;
+      }
     }
-    drive(lastTurn, ZONE_SPEED2);
+    lastSeenMs = nowMs;
+    boost = 0.0f;                      // ADDED: no boost over a bar
+    drive(lastTurn, BASE_PWM);
     return;
   }
-  barReads = 0;
+  barReads = 0; // Confirmation must be consecutive.
 
-  // ---- Line lost ----
-  if (!(peak >= MIN_LINE_PEAK && sum >= MIN_LINE_SUM)) {
+  if (!lineSeen) {
+    integral = 0.0f; // Clear stored correction before reacquiring the line.
+    boost = 0.0f;                      // ADDED: lost line = no boost
     clearReads = 0;
-    // Backup: line ended right after a bar-like reading = we passed the T-bar.
-    if (finishArmed && nowMs - wideSeenMs < BAR_BACKUP_MS) {
-      handleBar(nowMs);
-      return;
+    derivativeReady = false;
+    filteredDelta = 0.0f;
+    // CHANGED: was limitFloat(lastTurn, -15, 15), which weakened the turn
+    // exactly when the car slid off a curve. Now: pivot hard toward the side
+    // the line was last seen, at low speed, until the line comes back.
+    // CHANGED: turn toward the side the line was last CLEARLY seen on.
+    // (lastTurn could flip sign from D-term noise right before the line was
+    // lost, sending the car the wrong way. That made curves fail randomly.)
+    // Near-pivot (low base) so the car turns back instead of driving off.
+    if (lastSide != 0) {
+      drive(STEERING_SIGN * lastSide * RECOVERY_TURN, RECOVERY_BASE_PWM);
+    } else {
+      drive(lastTurn >= 0.0f ? RECOVERY_TURN : -RECOVERY_TURN, RECOVERY_BASE_PWM);
     }
-    // Pivot in place toward the side the line was last seen on.
-    const float side = (lastSide != 0) ? lastSide : (lastTurn >= 0.0f ? 1.0f : -1.0f);
-    drive(STEERING_SIGN * side * RECOVERY_TURN, 0.0f);
     return;
   }
 
-  // Arm the bar check after 10 clean readings (and some distance after the turnaround).
+  lastSeenMs = nowMs;
+  // Ignore a starting bar. Arm the finish only after ten valid narrow readings.
+  // CHANGED: after the turnaround, also require REARM_COUNTS of driving,
+  // so the car can't re-trigger on the bar it just turned on.
   if (!finishArmed && ++clearReads >= CLEAR_READS_TO_ARM &&
       (barsSeen == 0 || encoderAverage() >= REARM_COUNTS)) finishArmed = true;
-
-  // ---- Line position ----
   const float error = float(weighted) / float(sum) - CENTER_OFFSET;
+  // ADDED: remember the side only when clearly off-center, so noise near
+  // the middle can't change it.
   if (error > SIDE_MEMORY_ERROR) lastSide = 1;
   else if (error < -SIDE_MEMORY_ERROR) lastSide = -1;
 
-  // ---- ZONE STEERING: fixed turn + speed, applied immediately ----
-  const float a = fabsf(error);
-  float turn, speed;
-  if (a < ZONE0)      { turn = 0.0f;       speed = ZONE_SPEED0; }
-  else if (a < ZONE1) { turn = ZONE_TURN1; speed = ZONE_SPEED1; }
-  else if (a < ZONE2) { turn = ZONE_TURN2; speed = ZONE_SPEED2; }
-  else                { turn = ZONE_TURN3; speed = ZONE_SPEED3; }
+  float delta = 0.0f;
+  if (derivativeReady) {
+    delta = (error - previousError) * (float(SAMPLE_US) / float(elapsedUs));
+  }
+  filteredDelta += 0.35f * (delta - filteredDelta);
+  previousError = error;
+  derivativeReady = true;
+  const float pdError = error * PD_ERROR_SCALE;
+  const float pdDelta = filteredDelta * PD_ERROR_SCALE;
 
-  lastTurn = STEERING_SIGN * (error > 0.0f ? turn : -turn);
-  drive(lastTurn, speed);
+  // Integral uses scaled error-seconds. Reset on crossing the line and
+  // bound its contribution. Check saturation using this sample's P + D.
+  const float dt = float(elapsedUs) * 1e-6f;
+  if ((pdError > 0.0f && integral < 0.0f) || (pdError < 0.0f && integral > 0.0f)) {
+    integral = 0.0f;
+  }
+  const float pdTurn = 1.2*KP * pdError + KD * pdDelta;
+  const float currentTurn = pdTurn + KI * integral;
+  const bool saturated = (currentTurn >= MAX_TURN && pdError > 0.0f) ||
+                         (currentTurn <= -MAX_TURN && pdError < 0.0f);
+  if (fabsf(pdError) > INTEGRAL_DEADBAND && !saturated) {
+    integral += pdError * dt;
+  }
+  integral = limitFloat(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+
+  lastTurn = STEERING_SIGN * (pdTurn + KI * integral);
+  lastTurn = limitFloat(lastTurn, -MAX_TURN, MAX_TURN);
+
+  // ADDED: slow down the bigger the error, so the car can make tight curves.
+  float base = BASE_PWM - CURVE_SLOW * fabsf(error);
+  if (base < MIN_BASE_PWM) base = MIN_BASE_PWM;
+
+  // ADDED: straight-line boost with fast cut and brake before curves.
+  const float absError = fabsf(error);
+  if (absError < STRAIGHT_ERROR) {
+    boost += BOOST_RAMP_UP * dt;                    // straight: speed up
+  } else if (absError > BOOST_DROP_ERROR) {
+    if (boost >= BRAKE_MIN_BOOST) brakeUntilMs = nowMs + BRAKE_MS;  // was fast: brake
+    boost = 0.0f;                                   // curve coming: cut at once
+  } else {
+    boost -= BOOST_DECAY * dt;                      // in between: ease off fast
+  }
+  boost = limitFloat(boost, 0.0f, BOOST_MAX);
+
+  if (nowMs < brakeUntilMs) {
+    drive(lastTurn, 0.0f);    // brake: no forward drive, keep steering into the curve
+  } else {
+    drive(lastTurn, base + boost);
+  }
 }
