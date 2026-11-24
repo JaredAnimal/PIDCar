@@ -17,7 +17,7 @@ const float STEERING_ERROR_PERCENT = 160.0f; // CHANGED from 50: 50 gave KP ~3 i
 const float KD_TO_KP_RATIO = 10.0f; // D uses error change per nominal 6 ms.
 // ADDED (PID): integral term. It builds up while the car stays on one side of
 // the line (a long or sharp curve), adding extra turn the longer the curve lasts.
-const float KI_TO_KP_RATIO = 4.0f; // Integral accumulation uses seconds.
+const float KI_TO_KP_RATIO = 5.0f; // Integral accumulation uses seconds.
 const float INTEGRAL_MAX_TURN = 60.0f; // Maximum integral contribution in PWM.
 const float INTEGRAL_DEADBAND = 80.0f;      // CHANGED from 300: now also removes a steady offset on straights.
 const float CENTER_OFFSET = -0.0565749235f;  // New-car calibration with existing POSITION weights and integer normalization.
@@ -352,7 +352,7 @@ void loop() {
   if ((pdError > 0.0f && integral < 0.0f) || (pdError < 0.0f && integral > 0.0f)) {
     integral = 0.0f;
   }
-  const float pdTurn = 1.2*KP * pdError + KD * pdDelta;
+  const float pdTurn = 1.4*KP * pdError + KD * pdDelta;
   const float currentTurn = pdTurn + KI * integral;
   const bool saturated = (currentTurn >= MAX_TURN && pdError > 0.0f) ||
                          (currentTurn <= -MAX_TURN && pdError < 0.0f);
