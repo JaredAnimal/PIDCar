@@ -12,7 +12,7 @@ const uint8_t START_BUTTON = 73, STOP_BUTTON = 74;
 const uint8_t STATUS_LED = 41;
 
 // First parameters to tune. PWM uses 0..255, not percent.
-const float BASE_PWM = 100.0f;   // CHANGED from 45: your tested speed
+const float BASE_PWM = 110.0f;   // CHANGED from 45: your tested speed
 const float STEERING_ERROR_PERCENT = 160.0f; // CHANGED from 50: 50 gave KP ~3 in sensor units, too weak to stay centered.
 const float KD_TO_KP_RATIO = 10.0f; // D uses error change per nominal 6 ms.
 // ADDED (PID): integral term. It builds up while the car stays on one side of
@@ -41,7 +41,7 @@ const float TURN_LIMIT = 150.0f;
 // to zero and the car briefly brakes before the curve.
 const float STRAIGHT_ERROR = 0.8f;    // |error| below this = straight: ramp up
 const float BOOST_DROP_ERROR = 1.5f;  // |error| above this = curve: cut boost to 0 at once
-const float BOOST_MAX = 50.0f;        // Extra PWM on long straights (90 + 60 = 150)
+const float BOOST_MAX = 0.0f;        // Extra PWM on long straights (90 + 60 = 150)
 const float BOOST_RAMP_UP = 150.0f;   // PWM gained per second (0 -> 60 in 0.4 s)
 const float BOOST_DECAY = 300.0f;     // PWM lost per second between the two thresholds
 const float BRAKE_MIN_BOOST = 20.0f;  // Only brake if boost was at least this high
@@ -352,7 +352,7 @@ void loop() {
   if ((pdError > 0.0f && integral < 0.0f) || (pdError < 0.0f && integral > 0.0f)) {
     integral = 0.0f;
   }
-  const float pdTurn = KP * pdError + KD * pdDelta;
+  const float pdTurn = 1.2*KP * pdError + KD * pdDelta;
   const float currentTurn = pdTurn + KI * integral;
   const bool saturated = (currentTurn >= MAX_TURN && pdError > 0.0f) ||
                          (currentTurn <= -MAX_TURN && pdError < 0.0f);
